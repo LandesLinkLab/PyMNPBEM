@@ -1,0 +1,99 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# The PEP 639 `license = "GPL-2.0-or-later"` string form is deliberately not
+# used below: it forces Metadata-Version 2.4, which the pinned setuptools
+# cannot emit. The GPLv2+ trove classifier carries the same meaning.
+
+[build-system]
+# setuptools < 77 to keep Metadata-Version <= 2.3 (PEP 639 license-file
+# emission disabled). twine 6.x / pkginfo 1.12 not yet PEP 639 compliant.
+requires = ["setuptools>=64,<77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "mnpbem"
+version = "1.0.0"
+description = "PyMNPBEM — Python port of MNPBEM (Boundary Element Method for plasmonics, Garcia de Abajo & Howie 2002)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [
+    { name = "PyMNPBEM contributors" },
+]
+maintainers = [
+    { name = "PyMNPBEM contributors" },
+]
+keywords = [
+    "BEM",
+    "plasmonics",
+    "Maxwell",
+    "nanoparticle",
+    "electrodynamics",
+    "scattering",
+    "EELS",
+    "MNPBEM",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Scientific/Engineering :: Visualization",
+    "License :: OSI Approved :: GNU General Public License v2 or later (GPLv2+)",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.13",
+    "numba>=0.59",
+    "matplotlib>=3.8",
+]
+
+
+[project.optional-dependencies]
+# Hardware / runtime accelerators (each can be installed independently).
+gpu = [
+    "cupy-cuda12x>=13.0",
+]
+mpi = [
+    "mpi4py>=3.1",
+]
+fmm = [
+    "fmm3dpy>=1.0.4",
+]
+# All accelerators in one shot. pip resolves the nested extra on recent
+# versions (>=21.2); older pip should expand it manually:
+#   pip install "mnpbem[gpu,mpi,fmm]"
+all = [
+    "mnpbem[gpu,mpi,fmm]",
+]
+# Development tooling: test runner and packaging helpers.
+dev = [
+    "pytest>=8.0",
+    "build>=1.0",
+    "twine>=5.0",
+]
+
+
+[project.urls]
+Homepage = "https://github.com/Yoo-JK/PyMNPBEM"
+Repository = "https://github.com/Yoo-JK/PyMNPBEM"
+Issues = "https://github.com/Yoo-JK/PyMNPBEM/issues"
+
+
+[tool.setuptools.packages.find]
+include = ["mnpbem*"]
+exclude = ["docs*", "examples*"]
+
+
+[tool.setuptools.package-data]
+mnpbem = [
+    "materials/data/*",
+    "materials/data/**/*",
+    # Reference sphere meshes. Without these trisphere() silently degrades to a
+    # Fibonacci sphere, which breaks mesh-level agreement with MATLAB MNPBEM17.
+    "data/*.bin",
+]
