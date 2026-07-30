@@ -29,30 +29,6 @@ mechanically (see `docs/MIGRATION_GUIDE.md`). What the Python port adds:
 - **Numerical agreement with MATLAB MNPBEM17**, verified demo by demo over
   the full set of 72 MNPBEM demos.
 
-## Highlights
-
-- **Accuracy**: 58 / 72 demos at machine precision (`< 1e-12`) against MATLAB
-  MNPBEM17, and 0 demos failing the BAD threshold (`>= 1e-3`). The worst demo
-  agrees to 1.2e-4.
-- **Performance** (vs MATLAB MNPBEM17 single core, geo-mean):
-  - CPU: **2.21x** speedup
-  - GPU (single): **3.60x** speedup
-  - Multi-GPU: linear scaling on wavelength sweeps
-- **Iterative solver**: ACA / H-matrix with GMRES. Tested up to ~25 k faces.
-
-Benchmarks were taken as shell wall-time (`time matlab -batch ...` vs
-`time python ...`) on a 4× RTX A6000 / 64-core workstation.
-
-## Known limitations
-
-- Layered-substrate (`BEMRetLayer`) results differ from MATLAB by 7e-3 ~ 1.5e-2
-  in 5 of the 51 sphere / rod validation cases. The cause is the Sommerfeld
-  integration path, not the BEM formulation.
-- The mesh generators cannot be bit-identical to MATLAB: `polymesh2d` / `plate`
-  accumulate ULP-level differences from the underlying math libraries. Compare
-  meshed results with a tolerance rather than exact equality.
-- Dense solvers are memory-bound — a ~25 k-face dense retarded problem needs
-  roughly 40 GB. Use `BEMRetIter` (ACA / H-matrix) above that size.
 
 ## Installation
 
