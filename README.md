@@ -178,11 +178,10 @@ In addition, please cite this Python port:
 
 ```bibtex
 @software{pymnpbem_2026,
-  author = {Yoo, Jaekak},
-  title  = {{PyMNPBEM} (v1.0.0)},
-  year   = {2026},
-  url    = {https://github.com/Yoo-JK/PyMNPBEM},
-  note   = {Python port of MNPBEM17 with GPU acceleration and ACA / H-matrix solvers.}
+  author = {Yoo, Jaekak and Berwick, Ryan Thomas and Oh, Hyuncheol and Lin, Jiamu and Kim, Jae-Myoung and Link, Stephan and Landes, Christy F.},
+  title  = {PyMNPBEM: GPU-accelerated boundary element simulations of metallic nanoparticles},
+  year   = {TBU},
+  url    = {TBU}
 }
 ```
 
