@@ -184,12 +184,3 @@ In addition, please cite this Python port:
   url    = {TBU}
 }
 ```
-
-## Bug Reports & Contributions
-
-Please open an issue on GitHub. When reporting a numerical discrepancy
-against MATLAB MNPBEM17, include:
-- Python version, `mnpbem.__version__`, `numpy.__version__`
-- Mesh parameters (e.g. `trisphere(144, 20)`)
-- A minimal script that reproduces the discrepancy
-- Expected MATLAB output (preferably from the same demo file in `Demo/`)
