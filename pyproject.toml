@@ -12,9 +12,9 @@ build-backend = "setuptools.build_meta"
 
 
 [project]
-name = "mnpbem"
+name = "pymnpbem"
 version = "1.0.0"
-description = "PyMNPBEM — Python port of MNPBEM (Boundary Element Method for plasmonics, Garcia de Abajo & Howie 2002)"
+description = "PyMNPBEM: Python port of MNPBEM (Boundary Element Method for plasmonics, Garcia de Abajo & Howie 2002)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
@@ -79,9 +79,9 @@ dev = [
 
 
 [project.urls]
-Homepage = "https://github.com/Yoo-JK/PyMNPBEM"
-Repository = "https://github.com/Yoo-JK/PyMNPBEM"
-Issues = "https://github.com/Yoo-JK/PyMNPBEM/issues"
+Homepage = "https://github.com/LandesLinkLab/PyMNPBEM"
+Repository = "https://github.com/LandesLinkLab/PyMNPBEM"
+Issues = "https://github.com/Yoo-LandesLinkLab/PyMNPBEM/issues"
 
 
 [tool.setuptools.packages.find]
