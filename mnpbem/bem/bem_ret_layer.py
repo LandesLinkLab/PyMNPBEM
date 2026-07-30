@@ -1,0 +1,1970 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+import os
+import sys
+import time as _time
+
+from typing import List, Dict, Tuple, Optional, Union, Any, Callable
+
+import numpy as np
+from scipy.linalg import lu_factor, lu_solve
+
+from ..utils.gpu import lu_factor_dispatch, lu_solve_dispatch, matmul_dispatch, to_host, is_cupy_array
+from ..utils import gpu as _gpu_mod
+
+from ..greenfun import CompGreenRetLayer, CompStruct
+from .bem_ret import _vram_share_lu_kwargs
+from . import _numba_bem_elem as _bem_elem
+
+
+# memory-pool parity: when cupy is importable and MNPBEM_GPU=1 the
+# matrix-assembly routines below dispatch GEMM/LU through cupy via the
+# *_dispatch helpers in mnpbem.utils.gpu.  Without an explicit pool
+# free_all_blocks() between wavelengths, cupy's caching allocator keeps
+# every Sigma/Gamma/m_full residue alive across the sweep — on 12672-face
+# Au@Ag dimers this fragments past the 49 GB cap around wl 20-25.  Mirror
+# the BEMRet._init_gpu_assemble pattern: deviceSynchronize then
+# free_all_blocks at every reasonable boundary (start-of-wl, after each
+# large GEMM/LU group, and at function exit).  Implemented inline at
+# each call site (not via a helper) so static grep can audit coverage
+# the same way it does for ``bem_ret.py`` — see the MNPBEM_GPU_POOL_LIMIT_GB
+# documentation and the BEMRet commentary for the rationale.
+try:
+    import cupy as _cp_v172  # type: ignore
+    _CUPY_OK_V172 = True
+except Exception:
+    _cp_v172 = None  # type: ignore
+    _CUPY_OK_V172 = False
+
+
+# ---------------------------------------------------------------------------
+# Distributed build gate
+# ---------------------------------------------------------------------------
+# When ``MNPBEM_VRAM_SHARE_DISTRIBUTED=1`` plus ``MNPBEM_VRAM_SHARE=1`` and
+# ``MNPBEM_VRAM_SHARE_GPUS >= 2`` are set, the layer-substrate BEM build
+# routes the dense G/H/Sigma/m_full matrices through ``DistributedMatrix``
+# so that no N^2 buffer ever lives in pinned host memory simultaneously
+# across N GPUs -- each device only ever holds its own column tile.  The
+# LU factors (``G1_lu``, ``G2p_lu``, ``Gamma_lu``, ``m_lu``) are produced
+# by ``DistributedMatrix.lu_factor()`` (cuSolverMg) and carry the existing
+# ``('mgpu', ...)`` tag that ``lu_solve_dispatch`` already understands, so
+# the per-wavelength solve path stays the same.
+#
+# When the gate is OFF (default) the legacy single-GPU/host path runs
+# verbatim -- this keeps every regression scenario bit-identical.
+# ---------------------------------------------------------------------------
+
+
+def _init_profile_enabled() -> bool:
+    return os.environ.get('MNPBEM_INIT_PROFILE', '0') == '1'
+
+
+def _prof_mark(label, t_prev, store=None):
+    """Print + record an init() stage timing when MNPBEM_INIT_PROFILE=1.
+
+    Returns the current perf_counter so the caller can chain stage marks.
+    """
+    import time as _time
+    now = _time.perf_counter()
+    if _init_profile_enabled():
+        dt = now - t_prev
+        print('[init-prof] {:<22s} {:8.3f}s'.format(label, dt), flush=True)
+        if store is not None:
+            store.append((label, dt))
+    return now
+
+
+def _assemble_m_blocks_resident(
+        L1, L2p, Sigma1, Sigma1e, Gamma,
+        G2, G2e, H2, H2e,
+        npar, nperp, k, wd, wd_real, lowprec):
+    """Assemble the four m11..m22 BEM blocks with each operand uploaded to
+    the GPU exactly once.
+
+    The legacy path issued ~12 separate ``matmul_dispatch`` calls, each of
+    which re-uploaded BOTH operands and downloaded the result.  Reused
+    operands (L1 x3, Sigma1e x2, Sigma1 x2, Gammapar x2) were therefore
+    transferred over PCIe several times — ~5 GB of redundant traffic per
+    wavelength on a 5768-face fp32 substrate dimer (≈19s).  Here every
+    matrix is moved to the device once, all GEMMs run resident, and only
+    the four host m_ij blocks are downloaded.  Returns ``None`` when the
+    GPU path is unavailable so the caller falls back to the host path
+    (numerically identical, just slower).
+    """
+    if not (_CUPY_OK_V172 and getattr(_gpu_mod, 'USE_GPU', False)):
+        return None
+    if _vram_share_active():
+        # Multi-GPU column-split assembly is owned by matmul_dispatch's
+        # distributed path; do not shadow it with the single-device build.
+        return None
+    cp = _cp_v172
+    try:
+        n = L1.shape[0]
+
+        def up(a):
+            if a is None:
+                return None
+            ad = cp.asarray(a)
+            if lowprec and ad.dtype == cp.complex128:
+                ad = ad.astype(cp.complex64)
+            return ad
+
+        # large-mesh OOM fix: the previous form uploaded all ~16
+        # (n, n) operands simultaneously before the first GEMM.  At
+        # n=15072 / complex64 that is ~16 x 1.8 GB = 29 GB of inputs plus
+        # npar_outer + Gammapar + three diff_* + four m_ij intermediates
+        # (~21 GB) = ~50 GB peak, which overflows a 48 GB device.  cupy then
+        # raised OutOfMemoryError, the broad ``except`` returned None, and
+        # the build silently fell back to the host (CPU) GEMM path —
+        # turning a ~25 s GPU assemble into a ~630 s CPU assemble (the
+        # dominant share of the 20 min/wl the user observed at 15072 face).
+        #
+        # Fix: keep only the operands needed for the current sub-result
+        # resident, download each m_ij block as soon as it is formed, and
+        # free its device buffers before building the next one.  L1g and
+        # Gammapar (reused across blocks) stay resident; everything else is
+        # uploaded lazily.  Device peak now ~15-18 GB at n=15072, so the
+        # GPU path stays engaged.  Numerically identical to the previous
+        # all-resident form (same operations, same order).
+        def _free():
+            cp.cuda.runtime.deviceSynchronize()
+            cp.get_default_memory_pool().free_all_blocks()
+
+        nperp_col = cp.asarray(nperp)[:, None]
+        if lowprec:
+            nperp_col = nperp_col.astype(cp.dtype(wd_real))
+
+        L1g = up(L1)
+
+        # Gammapar = ik * (L1 - L2p) @ Gamma .* (npar @ npar')
+        L2pg = up(L2p); Gg = up(Gamma)
+        npar_outer = cp.asarray(npar) @ cp.asarray(npar).T
+        if lowprec:
+            npar_outer = npar_outer.astype(cp.dtype(wd_real))
+        Gammapar = 1j * k * (L1g - L2pg) @ Gg * npar_outer
+        if lowprec:
+            Gammapar = Gammapar.astype(cp.dtype(wd))
+        del L2pg, Gg, npar_outer
+        _free()
+
+        # diff_ss / diff_sh are reused by several blocks; diff_hh only by m12.
+        ss = up(G2['ss']); ess = up(G2e['ss'])
+        diff_ss = L1g @ ss - ess
+        del ess
+        sh = up(G2['sh']); esh = up(G2e['sh'])
+        diff_sh = L1g @ sh - esh
+        del esh
+
+        S1eg = up(Sigma1e)
+        # m11 = Sigma1e@ss - H2e.ss - ik*(Gammapar@diff_ss + diff_sh*nperp)
+        h2ess = up(H2e['ss'])
+        m11 = (S1eg @ ss - h2ess
+               - 1j * k * (Gammapar @ diff_ss + diff_sh * nperp_col))
+        if lowprec:
+            m11 = m11.astype(cp.dtype(wd))
+        m11_h = cp.asnumpy(m11)
+        del ss, h2ess, m11
+        _free()
+
+        # m12 = Sigma1e@sh - H2e.sh - ik*(Gammapar@diff_sh + diff_hh*nperp)
+        hh = up(G2['hh']); ehh = up(G2e['hh'])
+        diff_hh = L1g @ hh - ehh
+        del ehh
+        h2esh = up(H2e['sh'])
+        m12 = (S1eg @ sh - h2esh
+               - 1j * k * (Gammapar @ diff_sh + diff_hh * nperp_col))
+        if lowprec:
+            m12 = m12.astype(cp.dtype(wd))
+        m12_h = cp.asnumpy(m12)
+        del sh, h2esh, S1eg, diff_hh, Gammapar, m12
+        _free()
+
+        S1g = up(Sigma1)
+        # m21 = Sigma1@hs - H2.hs - ik*diff_ss*nperp
+        hs = up(G2['hs']); h2hs = up(H2['hs'])
+        m21 = (S1g @ hs - h2hs - 1j * k * diff_ss * nperp_col)
+        if lowprec:
+            m21 = m21.astype(cp.dtype(wd))
+        m21_h = cp.asnumpy(m21)
+        # download diff_ss before freeing -- the solve path needs it
+        # (constant per wavelength) and recomputing it as a c128 host GEMM in
+        # _solve_single costs ~55s/polarisation on a 15072-face dimer.
+        diff_ss_h = cp.asnumpy(diff_ss)
+        del hs, h2hs, diff_ss, m21
+        _free()
+
+        # m22 = Sigma1@hh - H2.hh - ik*diff_sh*nperp
+        h2hh = up(H2['hh'])
+        m22 = (S1g @ hh - h2hh - 1j * k * diff_sh * nperp_col)
+        if lowprec:
+            m22 = m22.astype(cp.dtype(wd))
+        m22_h = cp.asnumpy(m22)
+        diff_sh_h = cp.asnumpy(diff_sh)
+        del hh, h2hh, S1g, diff_sh, m22, L1g, nperp_col
+        _free()
+
+        if _init_profile_enabled():
+            print('[assemble-prof] resident GPU path OK (streamed)', flush=True)
+        return (m11_h, m12_h, m21_h, m22_h, diff_ss_h, diff_sh_h)
+    except Exception as _exc:
+        if _init_profile_enabled():
+            print('[assemble-prof] resident path FAILED -> host fallback: {!r}'.format(_exc), flush=True)
+        try:
+            cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+        return None
+
+
+def _vram_share_active() -> bool:
+    """Return True iff the distributed-build path should be taken.
+
+    Distinct from ``_vram_share_lu_kwargs``: that helper governs whether
+    the LU factor is dispatched to cuSolverMg, while this gate controls
+    whether the *build* (Green-function assembly, GEMMs, scatter) also
+    runs distributed.  Both gates are read separately so a user who only
+    wants the LU split can leave ``MNPBEM_VRAM_SHARE_DISTRIBUTED=0`` and
+    keep the legacy host build.
+    """
+    if not _CUPY_OK_V172:
+        return False
+    if os.environ.get('MNPBEM_VRAM_SHARE', '0') != '1':
+        return False
+    if os.environ.get('MNPBEM_VRAM_SHARE_DISTRIBUTED', '0') != '1':
+        return False
+    try:
+        n_gpus = int(os.environ.get('MNPBEM_VRAM_SHARE_GPUS', '1'))
+    except (TypeError, ValueError):
+        n_gpus = 1
+    if n_gpus < 2:
+        return False
+    # cuSolverMg must be loadable for the distributed LU factor to run.
+    try:
+        from ..utils.multi_gpu_lu import cusolvermg_available
+        if not cusolvermg_available():
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def _vram_share_distributed_kwargs() -> dict:
+    """Return ``{n_gpus, device_ids, block_size}`` for DistributedMatrix.
+
+    Reads the same ``MNPBEM_VRAM_SHARE_*`` env vars as
+    ``_vram_share_lu_kwargs`` so the block-cyclic layout matches what
+    ``lu_factor_dispatch(n_gpus=N)`` would use internally.  Block size is
+    fixed at 256 to align with the cuSolverMg samples and the
+    ``DistributedMatrix`` default.
+    """
+    try:
+        n_gpus = int(os.environ.get('MNPBEM_VRAM_SHARE_GPUS', '1'))
+    except (TypeError, ValueError):
+        n_gpus = 1
+    device_ids: Optional[List[int]] = None
+    dev_env = os.environ.get('MNPBEM_VRAM_SHARE_DEVICE_IDS', '')
+    if dev_env.strip():
+        try:
+            device_ids = [int(x) for x in dev_env.split(',') if x.strip()]
+        except Exception:
+            device_ids = None
+    return {'n_gpus': n_gpus, 'device_ids': device_ids, 'block_size': 256}
+
+
+# ---------------------------------------------------------------------------
+# Backend alignment helper for cupy/numpy mix safety
+# ---------------------------------------------------------------------------
+
+def _is_cupy_array(x: Any) -> bool:
+    """Return True if x is a cupy ndarray."""
+    if not hasattr(x, '__class__'):
+        return False
+    return 'cupy' in type(x).__module__ and hasattr(x, 'shape')
+
+
+def _backend_align(A: Any, B: Any) -> Tuple[Any, Any]:
+    """Return (A, B) on the same backend (cupy or numpy).
+
+    If one is cupy ndarray and the other is numpy ndarray, promote the
+    numpy one to cupy to keep GPU residency. Scalars and non-array values
+    are returned untouched.
+    """
+    a_is_cp = _is_cupy_array(A)
+    b_is_cp = _is_cupy_array(B)
+    if a_is_cp and not b_is_cp and isinstance(B, np.ndarray):
+        import cupy as cp
+        return A, cp.asarray(B)
+    if b_is_cp and not a_is_cp and isinstance(A, np.ndarray):
+        import cupy as cp
+        return cp.asarray(A), B
+    return A, B
+
+
+def _to_host_safe(x: Any) -> Any:
+    """Materialise x on the host as numpy array.
+
+    Cupy ndarrays are converted via cp.asnumpy.  Non-array types
+    (scalars, dicts, etc.) are returned unchanged.
+    """
+    if _is_cupy_array(x):
+        import cupy as cp
+        return cp.asnumpy(x)
+    return x
+
+
+# ---------------------------------------------------------------------------
+# Helper functions matching MATLAB inner/outer/matmul for bemretlayer
+# ---------------------------------------------------------------------------
+
+def _inner(nvec, a):
+    # MATLAB: inner(nvec, a) — dot product of nvec (n,3) with a (n,3) or (n,3,npol)
+    if not isinstance(a, np.ndarray):
+        return 0
+    if a.ndim == 2:
+        # (n, 3) -> (n,)
+        return np.sum(nvec * a, axis = 1)
+    else:
+        # (n, 3, npol) -> (n, npol)
+        return np.einsum('ij,ijk->ik', nvec, a)
+
+
+def _outer(nvec, val):
+    # MATLAB: outer(nvec, val) — nvec (n,3) * val (n,) or (n,npol) -> (n,3) or (n,3,npol)
+    if not isinstance(val, np.ndarray):
+        if val == 0:
+            return 0
+        return nvec * val
+    if val.ndim == 1:
+        # (n,) -> (n, 3)
+        return nvec * val[:, np.newaxis]
+    else:
+        # (n, npol) -> (n, 3, npol)
+        return nvec[:, :, np.newaxis] * val[:, np.newaxis, :]
+
+
+def _matmul(M, x):
+    # MATLAB: matmul(M, x) — M can be scalar or (n,n), x can be scalar/1D/2D/3D
+    if not isinstance(x, np.ndarray):
+        if x == 0:
+            return 0
+        if np.isscalar(M):
+            return M * x
+        return M * x
+
+    if np.isscalar(M):
+        return M * x
+
+    # M is (n, n), x can be (n,), (n, 3), (n, npol), (n, 3, npol)
+    if x.ndim == 1:
+        return M @ x
+    elif x.ndim == 2:
+        # (n, n) @ (n, cols) for each column
+        return M @ x
+    else:
+        # (n, 3, npol): apply M to each (n,) slice
+        shape = x.shape
+        return (M @ x.reshape(shape[0], -1)).reshape(shape)
+
+
+class BEMRetLayer(object):
+
+    name = 'bemsolver'
+    needs = {'sim': 'ret'}
+
+    def __init__(self,
+            p: Any,
+            layer: Any,
+            enei: Optional[float] = None,
+            greentab: Optional[Any] = None,
+            **options: Any) -> None:
+
+        self.p = p
+        self.layer = layer
+        self.greentab = greentab
+
+        self.enei = None
+        self.k = None
+        self.nvec = None
+        self.npar = None
+        self.eps1 = None
+        self.eps2 = None
+
+        # BEM matrices (MATLAB initmat.m variables)
+        self.L1 = None
+        self.L2p = None
+        self.G1i = None
+        self.G2pi = None
+        self.G2 = None
+        self.G2e = None
+        self.Sigma1 = None
+        self.Sigma1e = None
+        self.Gamma = None
+        self.m_lu = None
+        self.m_full = None
+
+        # LU factorizations
+        self._G1_lu = None
+        self._G2p_lu = None
+        self._Gamma_lu = None
+
+        # Green function with layer
+        self.g = None
+        self.options = options
+
+        # Opt-in MATLAB Engine route for the dense linear solves of
+        # the 2n x 2n block matrix.  Default False keeps numpy lu_factor /
+        # lu_solve; True delegates the matrix solve to MATLAB's mldivide,
+        # eliminating LU/solve numerical drift versus the MATLAB reference.
+        self.use_matlab_engine = options.get('use_matlab_engine', False)
+
+        if enei is not None:
+            self.init(enei)
+
+    def init(self,
+            enei: float) -> 'BEMRetLayer':
+
+        if self.enei is not None and np.isclose(self.enei, enei):
+            return self
+
+        # When the distributed-build gate is on, route
+        # through the cuSolverMg + DistributedMatrix assembly so the
+        # ``m_full`` 2n x 2n dense block never has to fit on a single
+        # device.  Falls back to the legacy host path on any unexpected
+        # failure so existing tests stay green.
+        if not self.use_matlab_engine and _vram_share_active():
+            try:
+                return self._init_distributed_precond(enei)
+            except Exception as _dist_exc:
+                import warnings as _w
+                _w.warn(
+                    '[warn] BEMRetLayer distributed build path failed ({}); '
+                    'falling back to legacy host path.'.format(_dist_exc),
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
+        # MATLAB-parity: free cupy pools before allocating the new
+        # wavelength's BEM matrices.  The previous wavelength's cached
+        # LU/Sigma residues (potentially ~10-20 GB on large-substrate dimers
+        # when *_dispatch routes through cupy) would otherwise stay pinned
+        # until Python rebinds the attribute mid-routine, causing a steady
+        # pool growth and eventual OOM 20+ wavelengths into a sweep.  Also
+        # drop the cached LU/Sigma references up front so free_all_blocks
+        # actually returns the device buffers.
+        for _attr in ('_G1_lu', '_G2p_lu', '_Gamma_lu', 'm_lu',
+                      'G1i', 'G2pi', 'G2', 'G2e',
+                      'L1', 'L2p', 'Sigma1', 'Sigma1e', 'Gamma',
+                      'm_full',
+                      '_sv_diff_ss', '_sv_diff_sh', '_sv_G2piGamma',
+                      '_sv_L1mL2p_Gamma'):
+            if hasattr(self, _attr):
+                setattr(self, _attr, None)
+        # also drop the reflected-Green per-component dicts that
+        # GreenRetLayer.eval_components caches on ``self.gr`` (G_comp /
+        # F_comp / Gp_comp).  For a 15072-face substrate dimer each of
+        # G_comp/F_comp is 5 dict entries x (n,n) c128 (~18 GB) and
+        # Gp_comp is 5 x (n,3,n) c128 (~54 GB) — a single wavelength's
+        # cache is roughly 90 GB of host RSS that survives across
+        # wavelengths because BEMRetLayer.init() never touched it.
+        # On a 7-wavelength sweep this pinned ~150 GB host residue
+        # *before* the next wavelength's eval_components could overwrite
+        # the dicts, and during the overwrite the peak briefly doubled
+        # (old dict + new dict held simultaneously), producing the
+        # 195 GB / 257 GB VmPeak the user observed at wl_0450 entry.
+        # Setting these to None up-front lets _gc.collect() actually
+        # free the prior wavelength's reflected blocks before the next
+        # BEM build allocates its own G/H/Sigma matrices.
+        _gr = getattr(getattr(self, 'g', None), 'gr', None)
+        if _gr is not None:
+            # ``G_comp``/``F_comp``/``Gp_comp`` are the per-component
+            # dicts produced by eval_components (used by BEMRetLayer);
+            # ``G``/``F``/``Gp`` are the single-key arrays produced by
+            # the scalar eval() path (used by potential/field).  Both
+            # families can pin (n,n) or (n,3,n) c128 buffers across
+            # wavelengths if not cleared.
+            for _gr_attr in ('G_comp', 'F_comp', 'Gp_comp', 'G', 'F', 'Gp'):
+                if hasattr(_gr, _gr_attr):
+                    setattr(_gr, _gr_attr, None)
+            # Reset cached enei so the next eval_components rebuilds
+            # the table cleanly without relying on stale data.
+            if hasattr(_gr, 'enei'):
+                _gr.enei = None
+        try:
+            import gc as _gc
+            _gc.collect()
+        except Exception:
+            pass
+        if _CUPY_OK_V172:
+            try:
+                _mempool_pre = _cp_v172.get_default_memory_pool()
+                _pinned_pre = _cp_v172.get_default_pinned_memory_pool()
+                try:
+                    _pool_limit_gb = float(
+                        os.environ.get('MNPBEM_GPU_POOL_LIMIT_GB', '0')
+                    )
+                except (TypeError, ValueError):
+                    _pool_limit_gb = 0.0
+                if _pool_limit_gb > 0:
+                    _mempool_pre.set_limit(size=int(_pool_limit_gb * (1024 ** 3)))
+                _cp_v172.cuda.runtime.deviceSynchronize()
+                _mempool_pre.free_all_blocks()
+                _pinned_pre.free_all_blocks()
+            except Exception:
+                pass
+
+        self.enei = enei
+
+        import time as _prof_time
+        _prof_t0 = _prof_time.perf_counter()
+        _prof_store: list = []
+
+        # Path A precision lever (mirrors bem_ret.py): when MNPBEM_GPU_LOWPREC=1
+        # build the G/H/Sigma/L/Gamma/m_full matrices in complex64 so the
+        # 2n x 2n m_full LU factor fits half the device memory (verified
+        # against complex128 reference: spectrum < 1.2e-3, BEM tolerance).
+        # LU factors and the host-resident auxiliary matrices are cast back
+        # to complex128 before exit so the downstream solve() path keeps
+        # its expected dtype (only the *values* carry complex64 precision).
+        _lowprec = os.environ.get('MNPBEM_GPU_LOWPREC', '0') == '1'
+        _wd = np.complex64 if _lowprec else np.complex128
+        _wd_real = np.float32 if _lowprec else np.float64
+
+        # Outer surface normals
+        nvec = self.p.nvec
+        self.nvec = nvec
+
+        # Perpendicular and parallel component of normal vector
+        # MATLAB: nperp = nvec(:,3);  npar = nvec - nperp * [0,0,1];
+        nperp = nvec[:, 2]
+        npar = nvec.copy()
+        npar[:, 2] = 0.0
+        self.npar = npar
+        self.nperp = nperp
+
+        # Wavenumber in vacuum
+        k = 2 * np.pi / enei
+        self.k = k
+
+        # Dielectric function values
+        eps1_vals = self.p.eps1(enei)
+        eps2_vals = self.p.eps2(enei)
+
+        if np.allclose(eps1_vals, eps1_vals[0]) and np.allclose(eps2_vals, eps2_vals[0]):
+            eps1 = eps1_vals[0]
+            eps2 = eps2_vals[0]
+        else:
+            eps1 = np.diag(eps1_vals)
+            eps2 = np.diag(eps2_vals)
+
+        self.eps1 = eps1
+        self.eps2 = eps2
+
+        # Create Green function with layer
+        if self.g is None:
+            opts = dict(self.options)
+            if self.greentab is not None:
+                # Pass the tabulated Green function's GreenTabLayer
+                gt = self.greentab
+                if hasattr(gt, 'tab'):
+                    # CompGreenTabLayer object - extract its GreenTabLayer
+                    opts['greentab_obj'] = gt.tab
+                elif hasattr(gt, 'r'):
+                    # Direct GreenTabLayer object
+                    opts['greentab_obj'] = gt
+            self.g = CompGreenRetLayer(self.p, self.p, self.layer, **opts)
+
+        _prof_t0 = _prof_mark('setup', _prof_t0, _prof_store)
+
+        # ---- Green functions for inner surfaces (plain scalar matrices) ----
+        # MATLAB: G11 = obj.g{1,1}.G(enei);  G21 = obj.g{2,1}.G(enei);
+        G11 = self.g.eval(0, 0, 'G', enei)
+        G21 = self.g.eval(1, 0, 'G', enei)
+        H11 = self.g.eval(0, 0, 'H1', enei)
+        H21 = self.g.eval(1, 0, 'H1', enei)
+
+        # Mixed contributions (plain matrices)
+        # MATLAB: G1 = G11 - G21;  G1e = eps1 * G11 - eps2 * G21;
+        G1 = self._sub_mat(G11, G21)
+        G1e = self._sub_mat(self._mul_eps(eps1, G11), self._mul_eps(eps2, G21))
+        H1 = self._sub_mat(H11, H21)
+        H1e = self._sub_mat(self._mul_eps(eps1, H11), self._mul_eps(eps2, H21))
+        # MNPBEM_GPU_LOWPREC: cast the inner-surface BEM blocks to complex64
+        # so downstream LU/matmul/Sigma stages operate at half memory.
+        if _lowprec:
+            G1 = G1.astype(_wd) if hasattr(G1, 'astype') else G1
+            G1e = G1e.astype(_wd) if hasattr(G1e, 'astype') else G1e
+            H1 = H1.astype(_wd) if hasattr(H1, 'astype') else H1
+            H1e = H1e.astype(_wd) if hasattr(H1e, 'astype') else H1e
+        _prof_t0 = _prof_mark('green-eval-inner', _prof_t0, _prof_store)
+
+        # release inner-surface Green intermediates as soon as the
+        # combined G1/G1e/H1/H1e are formed.  Mirrors BEMRet's per-stage
+        # del + free_all_blocks pattern.
+        del G11, G21, H11, H21
+        if _CUPY_OK_V172:
+            try:
+                _cp_v172.cuda.runtime.deviceSynchronize()
+                _cp_v172.get_default_memory_pool().free_all_blocks()
+            except Exception:
+                pass
+
+        # ---- Green functions for outer surfaces (structured dict) ----
+        # MATLAB: G22 = obj.g{2,2}.G(enei) -> structured {ss,hh,p,sh,hs}
+        #         G12 = obj.g{1,2}.G(enei) -> plain scalar
+        _prof_t0 = _prof_mark('green-eval-pre-outer', _prof_t0, _prof_store)
+        G22 = self.g.eval(1, 1, 'G', enei)
+        G12 = self.g.eval(0, 1, 'G', enei)
+        H22 = self.g.eval(1, 1, 'H2', enei)
+        H12 = self.g.eval(0, 1, 'H2', enei)
+        _prof_t0 = _prof_mark('green-eval-outer', _prof_t0, _prof_store)
+
+        # Build G2 structured dict: G2.ss = G22.ss - G12, etc.
+        G2 = self._build_outer_mixed(G22, G12)
+        H2 = self._build_outer_mixed(H22, H12)
+
+        # Build G2e structured dict: G2e.ss = eps2*G22.ss - eps1*G12, etc.
+        G2e = self._build_outer_mixed_eps(G22, G12, eps2, eps1)
+        H2e = self._build_outer_mixed_eps(H22, H12, eps2, eps1)
+        # MNPBEM_GPU_LOWPREC: cast the structured outer-surface blocks to
+        # complex64 so downstream LU/Sigma/m_full stages operate at half
+        # memory.  Mirrors the G1/G1e/H1/H1e cast above.
+        if _lowprec:
+            for _d in (G2, G2e, H2, H2e):
+                if isinstance(_d, dict):
+                    for _k in list(_d.keys()):
+                        _v = _d[_k]
+                        if hasattr(_v, 'astype'):
+                            _d[_k] = _v.astype(_wd)
+        # release outer-surface Green intermediates after the
+        # structured G2/G2e/H2/H2e dicts have been built.  G22 is a dict
+        # of N^2 substrate-table evaluations (~5 buffers for an outer
+        # block); freeing it now keeps the pool from carrying double the
+        # peak through the LU factorizations below.
+        del G22, G12, H22, H12
+        if _CUPY_OK_V172:
+            try:
+                _cp_v172.cuda.runtime.deviceSynchronize()
+                _cp_v172.get_default_memory_pool().free_all_blocks()
+            except Exception:
+                pass
+
+        n = G1.shape[0]
+
+        if self.use_matlab_engine:
+            # ---- Delegate the entire BEM matrix construction
+            # (initmat.m sequence) to MATLAB to inherit MATLAB's exact BLAS
+            # ordering and rounding behavior on each matmul/inv. ----
+            from .matlab_bem import matlab_bem_init
+
+            eps1_diag = (np.full(n, eps1, dtype=complex) if np.isscalar(eps1)
+                         else np.asarray(np.diag(eps1) if eps1.ndim == 2 else eps1, dtype=complex))
+            eps2_diag = (np.full(n, eps2, dtype=complex) if np.isscalar(eps2)
+                         else np.asarray(np.diag(eps2) if eps2.ndim == 2 else eps2, dtype=complex))
+
+            ml_in_G22 = G22 if isinstance(G22, dict) else {'ss': G22, 'hh': G22, 'p': G22}
+            ml_in_H22 = H22 if isinstance(H22, dict) else {'ss': H22, 'hh': H22, 'p': H22}
+
+            mout = matlab_bem_init(
+                G11, G21 if isinstance(G21, np.ndarray) else np.zeros((n, n), dtype=complex),
+                H11, H21 if isinstance(H21, np.ndarray) else np.zeros((n, n), dtype=complex),
+                ml_in_G22, G12 if isinstance(G12, np.ndarray) else np.zeros((n, n), dtype=complex),
+                ml_in_H22, H12 if isinstance(H12, np.ndarray) else np.zeros((n, n), dtype=complex),
+                eps1_diag, eps2_diag, k, nvec)
+
+            G1 = mout['G1']
+            G1i = mout['G1i']
+            G2pi = mout['G2pi']
+            G2 = {
+                'ss': mout['G2_ss'], 'hh': mout['G2_hh'], 'p': mout['G2_p'],
+                'sh': mout['G2_sh'], 'hs': mout['G2_hs'],
+            }
+            G2e = {
+                'ss': mout['G2e_ss'], 'hh': mout['G2e_hh'], 'p': mout['G2e_p'],
+                'sh': mout['G2e_sh'], 'hs': mout['G2e_hs'],
+            }
+            Sigma1 = mout['Sigma1']
+            Sigma1e = mout['Sigma1e']
+            L1 = mout['L1']
+            L2p = mout['L2p']
+            Gamma = mout['Gamma']
+            m_full = mout['m_full']
+
+            self.m_full = m_full
+            self.m_lu = None
+            self._G1_lu = None
+            self._G2p_lu = None
+            self._Gamma_lu = None
+        else:
+            # ---- Auxiliary matrices (MATLAB initmat.m lines 51-68) ----
+            # Inverse of G1 and of parallel component G2.p
+            self._G1_lu = lu_factor_dispatch(G1, **_vram_share_lu_kwargs())
+            G1i = lu_solve_dispatch(self._G1_lu, np.eye(G1.shape[0], dtype=_wd))
+
+            self._G2p_lu = lu_factor_dispatch(G2['p'], **_vram_share_lu_kwargs())
+            G2pi = lu_solve_dispatch(self._G2p_lu, np.eye(G2['p'].shape[0], dtype=_wd))
+            # free pools after the two G LU factorizations + their
+            # inverses (each LU is ~N^2 complex; the eye-product N^2 too).
+            if _CUPY_OK_V172:
+                try:
+                    _cp_v172.cuda.runtime.deviceSynchronize()
+                    _cp_v172.get_default_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
+
+            # Sigma matrices [Eq.(21)]
+            Sigma1 = matmul_dispatch(H1, G1i)
+            Sigma1e = matmul_dispatch(H1e, G1i)
+            Sigma2p = matmul_dispatch(H2['p'], G2pi)
+
+            # Auxiliary dielectric function matrices
+            L1 = matmul_dispatch(G1e, G1i)
+            L2p = matmul_dispatch(G2e['p'], G2pi)
+            # G1e/H1/H1e and the H/H1/G part of H2 are no longer
+            # needed after Sigma/L are formed.  Drop the local refs so the
+            # cupy pool can recycle them before the m_full GEMMs below.
+            del H1, H1e, G1e
+            if _CUPY_OK_V172:
+                try:
+                    _cp_v172.cuda.runtime.deviceSynchronize()
+                    _cp_v172.get_default_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
+
+            # Gamma matrix
+            self._Gamma_lu = lu_factor_dispatch(Sigma1 - Sigma2p, **_vram_share_lu_kwargs())
+            Gamma = lu_solve_dispatch(self._Gamma_lu, np.eye(Sigma1.shape[0], dtype=_wd))
+            del Sigma2p
+            if _CUPY_OK_V172:
+                try:
+                    _cp_v172.cuda.runtime.deviceSynchronize()
+                    _cp_v172.get_default_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
+
+            # ---- Set up 2x2 block response matrix (MATLAB initmat.m lines 72-77) ----
+            # m{1,1} = Sigma1e*G2.ss - H2e.ss - ik*(Gammapar*(L1*G2.ss - G2e.ss)
+            #          + bsxfun(@times, L1*G2.sh - G2e.sh, nperp))
+            #
+            # Fast path: when single-device cupy is active, assemble all four
+            # blocks GPU-resident with each operand uploaded once (avoids the
+            # ~5 GB/wavelength of redundant PCIe traffic the per-matmul
+            # dispatch incurs).  Gammapar is recomputed inside the helper from
+            # L1/L2p/Gamma so the resident path never re-uploads it; the host
+            # Gammapar below is only built for the fallback.
+            _m_blocks = _assemble_m_blocks_resident(
+                L1, L2p, Sigma1, Sigma1e, Gamma,
+                G2, G2e, H2, H2e, npar, nperp, k, _wd, _wd_real, _lowprec)
+
+            # MNPBEM_GPU_LOWPREC: cast nperp to float32 so the
+            # broadcasting multiplies below stay in complex64.
+            _nperp_col = nperp[:, np.newaxis]
+            if _lowprec:
+                _nperp_col = _nperp_col.astype(_wd_real)
+
+            # capture diff_ss/diff_sh host copies emitted by the
+            # resident assemble so the solve path can reuse them without a
+            # second c128 GEMM.  ``None`` when the host fallback path runs.
+            _sv_diff_ss_cap = None
+            _sv_diff_sh_cap = None
+            if _m_blocks is not None:
+                m11, m12, m21, m22, _sv_diff_ss_cap, _sv_diff_sh_cap = _m_blocks
+                del _m_blocks
+                diff_ss = diff_sh = diff_hh = None  # consumed on device
+                Gammapar = None                     # recomputed inside helper
+            else:
+                # Gammapar = ik*(L1-L2p)*Gamma .* (npar*npar')
+                # Element-wise multiply with outer product of parallel normals
+                npar_outer = npar @ npar.T  # (n, n)
+                if _lowprec:
+                    npar_outer = npar_outer.astype(_wd_real)
+                Gammapar = 1j * k * matmul_dispatch(L1 - L2p, Gamma) * npar_outer
+                if _lowprec and hasattr(Gammapar, 'astype'):
+                    Gammapar = Gammapar.astype(_wd)
+                del npar_outer
+
+                diff_ss = matmul_dispatch(L1, G2['ss']) - G2e['ss']
+                diff_sh = matmul_dispatch(L1, G2['sh']) - G2e['sh']
+                diff_hh = matmul_dispatch(L1, G2['hh']) - G2e['hh']
+
+                m11 = (matmul_dispatch(Sigma1e, G2['ss']) - H2e['ss']
+                    - 1j * k * (matmul_dispatch(Gammapar, diff_ss) + diff_sh * _nperp_col))
+                m12 = (matmul_dispatch(Sigma1e, G2['sh']) - H2e['sh']
+                    - 1j * k * (matmul_dispatch(Gammapar, diff_sh) + diff_hh * _nperp_col))
+                m21 = (matmul_dispatch(Sigma1, G2['hs']) - H2['hs']
+                    - 1j * k * diff_ss * _nperp_col)
+                m22 = (matmul_dispatch(Sigma1, G2['hh']) - H2['hh']
+                    - 1j * k * diff_sh * _nperp_col)
+                # MNPBEM_GPU_LOWPREC: defensively cast the m_ij blocks to the
+                # working dtype in case any 1j*k * complex64 broadcast leaked
+                # back to complex128 (numpy default literal dtype).
+                if _lowprec:
+                    if hasattr(m11, 'astype'): m11 = m11.astype(_wd)
+                    if hasattr(m12, 'astype'): m12 = m12.astype(_wd)
+                    if hasattr(m21, 'astype'): m21 = m21.astype(_wd)
+                    if hasattr(m22, 'astype'): m22 = m22.astype(_wd)
+            # matmul_dispatch may return cupy
+            # arrays under MNPBEM_GPU=1.  Materialise the m11..m22 blocks
+            # on the host before assembling m_full so the 4*N^2 buffer
+            # lives in pinned host memory (the cuSolverMg LU input is
+            # uploaded internally per-tile).  This also lets the per-block
+            # device buffers be released before the LU factor below.
+            if is_cupy_array(m11):
+                m11 = to_host(m11)
+            if is_cupy_array(m12):
+                m12 = to_host(m12)
+            if is_cupy_array(m21):
+                m21 = to_host(m21)
+            if is_cupy_array(m22):
+                m22 = to_host(m22)
+            # diff_* and Gammapar are consumed by the m11..m22
+            # forms; drop them so the m_full assemble below sees max
+            # headroom.  H2/H2e remain only via their already-formed terms.
+            del diff_ss, diff_sh, diff_hh, Gammapar, H2, H2e
+            if _CUPY_OK_V172:
+                try:
+                    _cp_v172.cuda.runtime.deviceSynchronize()
+                    _cp_v172.get_default_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
+
+            # Assemble 2x2 block matrix (2n x 2n) and LU factorize
+            # MNPBEM_GPU_LOWPREC: build m_full in complex64 so the device
+            # LU factor input fits at half memory (e.g. n=15096 -> 7.3 GB
+            # instead of 14.6 GB), unblocking large-substrate cases that
+            # otherwise OOM during the LU copy.
+            m_full = np.empty((2 * n, 2 * n), dtype=_wd)
+            m_full[:n, :n] = m11
+            m_full[:n, n:] = m12
+            m_full[n:, :n] = m21
+            m_full[n:, n:] = m22
+            del m11, m12, m21, m22
+            if _CUPY_OK_V172:
+                try:
+                    _cp_v172.cuda.runtime.deviceSynchronize()
+                    _cp_v172.get_default_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
+
+            _prof_t0 = _prof_mark('matrix-assemble', _prof_t0, _prof_store)
+            self.m_full = None
+            self.m_lu = lu_factor_dispatch(m_full, **_vram_share_lu_kwargs())
+            _prof_t0 = _prof_mark('m_full-LU', _prof_t0, _prof_store)
+            # the dense m_full (2n x 2n) is now captured by the LU
+            # factor; drop the local handle so its 4*N^2 complex buffer
+            # returns to the pool before we exit init().
+            del m_full
+            if _CUPY_OK_V172:
+                try:
+                    _cp_v172.cuda.runtime.deviceSynchronize()
+                    _cp_v172.get_default_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
+
+        # Store all needed matrices.  VRAM-share path: when the
+        # m_full LU factor is owned by cuSolverMg (multi-GPU), keeping
+        # G1i/G2pi/L1/L2p/Sigma1/Sigma1e/Gamma on device merely doubles
+        # the auxiliary-matrix footprint without benefit — solve()/
+        # _solve_single uses matmul_dispatch which uploads on demand.
+        # Materialise on host so the device pool can be compacted before
+        # the per-wavelength solve loop.
+        if is_cupy_array(G1i):
+            G1i = to_host(G1i)
+        if is_cupy_array(G2pi):
+            G2pi = to_host(G2pi)
+        if is_cupy_array(L1):
+            L1 = to_host(L1)
+        if is_cupy_array(L2p):
+            L2p = to_host(L2p)
+        if is_cupy_array(Sigma1):
+            Sigma1 = to_host(Sigma1)
+        if is_cupy_array(Sigma1e):
+            Sigma1e = to_host(Sigma1e)
+        if is_cupy_array(Gamma):
+            Gamma = to_host(Gamma)
+        if isinstance(G2, dict):
+            for _k in list(G2.keys()):
+                if is_cupy_array(G2[_k]):
+                    G2[_k] = to_host(G2[_k])
+        if isinstance(G2e, dict):
+            for _k in list(G2e.keys()):
+                if is_cupy_array(G2e[_k]):
+                    G2e[_k] = to_host(G2e[_k])
+
+        # solve-side recomputation fix: ``_solve_single`` (called once
+        # per polarisation) recomputed several constant (n,n)@(n,n) GEMMs that
+        # depend only on the BEM matrices, not on the excitation RHS:
+        #     diff_ss     = L1 @ G2.ss - G2e.ss
+        #     diff_sh     = L1 @ G2.sh - G2e.sh
+        #     G2piGamma   = G2pi @ Gamma
+        #     L1mL2pGamma = (L1 - L2p) @ Gamma
+        # On a 15072-face two-polarisation sweep this redundancy dominated the
+        # post-init solve (h2par alone was ~170s/pol of c128 GEMM).  Build them
+        # ONCE here -- crucially, BEFORE the complex128 cast-back below, so the
+        # GEMMs run in complex64 (≈8x faster on the GPU + half the PCIe traffic)
+        # and the cached blocks stay c64 (half the host RSS).  diff_ss/diff_sh
+        # are reused from the resident assemble (zero extra GEMM); only the host
+        # fallback path recomputes them.  numpy upcasts the c64 cache to c128
+        # automatically when it multiplies the complex128 solve RHS, so the
+        # solve output keeps full c128 dtype.
+        _diff_ss_cap = locals().get('_sv_diff_ss_cap', None)
+        _diff_sh_cap = locals().get('_sv_diff_sh_cap', None)
+        if _diff_ss_cap is not None:
+            self._sv_diff_ss = _diff_ss_cap
+        else:
+            self._sv_diff_ss = matmul_dispatch(L1, G2['ss']) - G2e['ss']
+        if _diff_sh_cap is not None:
+            self._sv_diff_sh = _diff_sh_cap
+        else:
+            self._sv_diff_sh = matmul_dispatch(L1, G2['sh']) - G2e['sh']
+        self._sv_G2piGamma = matmul_dispatch(G2pi, Gamma)
+        self._sv_L1mL2p_Gamma = matmul_dispatch(L1 - L2p, Gamma)
+        if is_cupy_array(self._sv_diff_ss):
+            self._sv_diff_ss = to_host(self._sv_diff_ss)
+        if is_cupy_array(self._sv_diff_sh):
+            self._sv_diff_sh = to_host(self._sv_diff_sh)
+        if is_cupy_array(self._sv_G2piGamma):
+            self._sv_G2piGamma = to_host(self._sv_G2piGamma)
+        if is_cupy_array(self._sv_L1mL2p_Gamma):
+            self._sv_L1mL2p_Gamma = to_host(self._sv_L1mL2p_Gamma)
+
+        # MNPBEM_GPU_LOWPREC: cast the host-resident auxiliary matrices
+        # back to complex128 so downstream solve()/_solve_single sees its
+        # expected dtype (the *values* keep complex64 precision; only the
+        # container is widened).  Mirrors the bem_ret.py pattern.
+        if _lowprec:
+            def _c128(_v):
+                if (_v is not None and hasattr(_v, 'astype')
+                        and hasattr(_v, 'dtype')
+                        and _v.dtype == np.complex64):
+                    return _v.astype(np.complex128)
+                return _v
+            G1i = _c128(G1i)
+            G2pi = _c128(G2pi)
+            L1 = _c128(L1)
+            L2p = _c128(L2p)
+            Sigma1 = _c128(Sigma1)
+            Sigma1e = _c128(Sigma1e)
+            Gamma = _c128(Gamma)
+            if isinstance(G2, dict):
+                for _k in list(G2.keys()):
+                    G2[_k] = _c128(G2[_k])
+            if isinstance(G2e, dict):
+                for _k in list(G2e.keys()):
+                    G2e[_k] = _c128(G2e[_k])
+            # LU factors are intentionally left in their native fp32/
+            # complex64 form on the device.  CRITICAL difference vs
+            # bem_ret.py: m_lu here is the (2n x 2n) block LU (~14.6 GB
+            # c128 at n=15096); an in-place device astype(c128) would
+            # keep BOTH the c64 source (7.3 GB) and the c128 image
+            # (14.6 GB) alive while cupy ran the copy, and accumulated
+            # across the four LU factors this pinned ~25 GB of device
+            # memory after init() returned.  The next wavelength's
+            # m_full c64 build (7.3 GB) then could not find a contiguous
+            # chunk and the cuSolverMg / cupy LU path stalled (the
+            # user-visible "warmup done, then 0% GPU forever" hang at
+            # wl 3 of the sub-fp32 sweep).
+            #
+            # Fix: keep the LU factor c64 on device.  ``lu_solve_dispatch``
+            # has been taught to down-cast a complex128 RHS to the LU
+            # dtype before cusolverDnZgetrs and up-cast the result back,
+            # so downstream solve() sees its expected c128 output without
+            # the device-side dtype widening.  This preserves the full
+            # 4x memory saving + 14x LU speed-up of fp32 mode while
+            # leaving GPU residue at 0 GB after each wavelength's cleanup.
+            pass
+
+        self.G1i = G1i
+        self.G2pi = G2pi
+        self.G2 = G2
+        self.G2e = G2e
+        self.L1 = L1
+        self.L2p = L2p
+        self.Sigma1 = Sigma1
+        self.Sigma1e = Sigma1e
+        self.Gamma = Gamma
+
+        # final cleanup at wavelength-end: ensure every transient
+        # LU/Sigma/Gamma allocation has been compacted out of the cupy
+        # pool before the BEM solver returns to the caller.  Mirrors
+        # BEMRet._init_gpu_assemble's closing free_all_blocks pair.
+        if _CUPY_OK_V172:
+            try:
+                _cp_v172.cuda.runtime.deviceSynchronize()
+                _cp_v172.get_default_memory_pool().free_all_blocks()
+                _cp_v172.get_default_pinned_memory_pool().free_all_blocks()
+            except Exception:
+                pass
+
+        _prof_t0 = _prof_mark('host-transfer+cleanup', _prof_t0, _prof_store)
+        if _init_profile_enabled():
+            _tot = sum(d for _, d in _prof_store)
+            print('[init-prof] {:<22s} {:8.3f}s'.format('TOTAL', _tot), flush=True)
+
+        return self
+
+    def _sub_mat(self,
+            A: Any,
+            B: Any) -> Any:
+        if isinstance(B, (int, float)) and B == 0:
+            return _to_host_safe(A)
+        if isinstance(A, (int, float)) and A == 0:
+            return _to_host_safe(-B if not _is_cupy_array(B) else -B)
+        # Host-resident A - B is a thread-invariant N^2 element-wise op
+        # (numpy runs it single-threaded).  When both operands already live
+        # on the host, the numba-parallel subtract is bit-identical and
+        # ~10x faster on a large substrate; cupy/mixed operands keep the
+        # existing backend-aligned path untouched.
+        if (not _is_cupy_array(A) and not _is_cupy_array(B)
+                and isinstance(A, np.ndarray) and isinstance(B, np.ndarray)
+                and A.ndim == 2 and B.ndim == 2):
+            return _bem_elem.sub2(A, B)
+        A, B = _backend_align(A, B)
+        result = A - B
+        return _to_host_safe(result)
+
+    def _mul_eps(self,
+            eps: Any,
+            M: Any) -> Any:
+        if isinstance(M, (int, float)) and M == 0:
+            return 0
+        # Preserve M's working precision.  Under MNPBEM_GPU_LOWPREC the Green
+        # buffers are complex64 while ``eps`` (the dielectric) is a complex128
+        # scalar or diagonal; the product would otherwise upcast the result to
+        # complex128, doubling host RAM and forcing the distributed dense LU
+        # back into fp64 (~13x slower on the A6000).  Cast eps to M's dtype
+        # first so the whole outer/eps assembly stays c64.
+        if hasattr(M, 'dtype'):
+            if np.isscalar(eps):
+                eps = M.dtype.type(eps)
+            elif hasattr(eps, 'astype') and eps.dtype != M.dtype:
+                eps = eps.astype(M.dtype)
+        if np.isscalar(eps):
+            return _to_host_safe(eps * M)
+        # ``eps`` is only ever constructed as a diagonal matrix
+        # (np.diag(eps_vals)) in init() for the per-face varying-eps case
+        # (e.g. Au@Ag dimer where the dielectric differs per particle).
+        # ``eps @ M`` therefore performs a full O(n^3) GEMM that is
+        # mathematically identical to a row-scaling by the diagonal — which
+        # is O(n^2).  Extract the diagonal once (O(n)) and broadcast-multiply
+        # instead.  On a 15072-face dimer this removes ~20 dense n^3 GEMMs
+        # per wavelength (each ~35s on host / ~1.5s on GPU) from the
+        # green-eval / matrix-assemble stages.
+        if hasattr(eps, 'ndim') and eps.ndim == 2:
+            xp = np
+            if _is_cupy_array(eps) or _is_cupy_array(M):
+                import cupy as _cp_local
+                xp = _cp_local
+                eps, M = _backend_align(eps, M)
+            eps_diag = xp.diagonal(eps).reshape(-1, 1)
+            if M.ndim == 2:
+                result = eps_diag * M
+            else:
+                # (n, 3, ncol) or similar — scale along the leading axis.
+                result = eps_diag.reshape((-1,) + (1,) * (M.ndim - 1)) * M
+            return _to_host_safe(result)
+        eps, M = _backend_align(eps, M)
+        result = eps @ M
+        return _to_host_safe(result)
+
+    def _build_outer_mixed(self,
+            G_struct: Any,
+            G_plain: Any) -> Dict[str, Any]:
+        # MATLAB: G2.ss = G22.ss - G12;  G2.hh = G22.hh - G12;  G2.p = G22.p - G12;
+        #         G2.sh = G22.sh;  G2.hs = G22.hs;
+        if isinstance(G_struct, dict):
+            result = {}
+            for key in ('ss', 'hh', 'p'):
+                result[key] = self._sub_mat(G_struct[key], G_plain)
+            result['sh'] = G_struct.get('sh', 0)
+            result['hs'] = G_struct.get('hs', 0)
+            return result
+        else:
+            # If G_struct is not structured, treat as plain: all components are G_struct - G_plain
+            val = self._sub_mat(G_struct, G_plain)
+            return {'ss': val, 'hh': val, 'p': val, 'sh': 0, 'hs': 0}
+
+    def _build_outer_mixed_eps(self,
+            G_struct: Any,
+            G_plain: Any,
+            eps_outer: Any,
+            eps_inner: Any) -> Dict[str, Any]:
+        # MATLAB: G2e.ss = eps2*G22.ss - eps1*G12;  etc.
+        #         G2e.sh = eps2*G22.sh;  G2e.hs = eps2*G22.hs;
+        if isinstance(G_struct, dict):
+            result = {}
+            for key in ('ss', 'hh', 'p'):
+                result[key] = self._sub_mat(
+                    self._mul_eps(eps_outer, G_struct[key]),
+                    self._mul_eps(eps_inner, G_plain))
+            result['sh'] = self._mul_eps(eps_outer, G_struct.get('sh', 0))
+            result['hs'] = self._mul_eps(eps_outer, G_struct.get('hs', 0))
+            return result
+        else:
+            val = self._sub_mat(
+                self._mul_eps(eps_outer, G_struct),
+                self._mul_eps(eps_inner, G_plain))
+            return {'ss': val, 'hh': val, 'p': val, 'sh': 0, 'hs': 0}
+
+    def _excitation(self,
+            exc: Any) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+
+        enei = exc.enei if hasattr(exc, 'enei') else exc['enei']
+        nfaces = self.p.nfaces if hasattr(self.p, 'nfaces') else self.p.n
+
+        def get_field(name: str) -> Any:
+            if hasattr(exc, name):
+                val = getattr(exc, name)
+                if isinstance(val, np.ndarray):
+                    return val
+                return val
+            elif isinstance(exc, dict) and name in exc:
+                val = exc[name]
+                if isinstance(val, np.ndarray):
+                    return val
+                return val
+            return 0
+
+        phi1 = get_field('phi1')
+        phi1p = get_field('phi1p')
+        a1 = get_field('a1')
+        a1p = get_field('a1p')
+        phi2 = get_field('phi2')
+        phi2p = get_field('phi2p')
+        a2 = get_field('a2')
+        a2p = get_field('a2p')
+
+        k = 2 * np.pi / enei
+
+        eps1 = self.p.eps1(enei)
+        eps2 = self.p.eps2(enei)
+        nvec = self.nvec
+
+        # Potential jumps: Eqs. (10,11)
+        phi = self._subtract(phi2, phi1)
+        a = self._subtract(a2, a1)
+
+        # Eq. (15): alpha = a2p - a1p - ik*(outer(nvec, phi2, eps2) - outer(nvec, phi1, eps1))
+        outer_term2 = self._outer_eps(nvec, phi2, eps2)
+        outer_term1 = self._outer_eps(nvec, phi1, eps1)
+        alpha = self._subtract(a2p, a1p) - 1j * k * self._subtract(outer_term2, outer_term1)
+
+        # Eq. (18): De = matmul(eps2, phi2p) - matmul(eps1, phi1p)
+        #               - ik*(inner(nvec, a2, eps2) - inner(nvec, a1, eps1))
+        matmul_term2 = self._matmul_eps(eps2, phi2p)
+        matmul_term1 = self._matmul_eps(eps1, phi1p)
+        inner_term2 = self._inner_eps(nvec, a2, eps2)
+        inner_term1 = self._inner_eps(nvec, a1, eps1)
+
+        De = self._subtract(matmul_term2, matmul_term1) - 1j * k * self._subtract(inner_term2, inner_term1)
+
+        return phi, a, alpha, De
+
+    def _subtract(self,
+            a: Any,
+            b: Any) -> Any:
+
+        if isinstance(a, np.ndarray) and isinstance(b, np.ndarray):
+            return a - b
+        elif isinstance(a, np.ndarray):
+            return a if b == 0 else a - b
+        elif isinstance(b, np.ndarray):
+            return -b if a == 0 else a - b
+        else:
+            return a - b
+
+    def _outer_eps(self,
+            nvec: np.ndarray,
+            phi: Any,
+            eps: np.ndarray) -> Any:
+
+        if isinstance(phi, np.ndarray):
+            if phi.ndim == 1:
+                return nvec * (phi * eps)[:, np.newaxis]
+            else:
+                npol = phi.shape[1]
+                n = len(nvec)
+                result = np.zeros((n, 3, npol), dtype = complex)
+                for ipol in range(npol):
+                    result[:, :, ipol] = nvec * (phi[:, ipol] * eps)[:, np.newaxis]
+                return result
+        elif phi == 0:
+            return 0
+        else:
+            return nvec * (phi * eps)
+
+    def _inner_eps(self,
+            nvec: np.ndarray,
+            a: Any,
+            eps: np.ndarray) -> Any:
+
+        if isinstance(a, np.ndarray) and a.ndim >= 2:
+            if a.ndim == 2:
+                dot = np.sum(nvec * a, axis = 1)
+                return dot * eps
+            else:
+                npol = a.shape[2]
+                n = len(nvec)
+                result = np.zeros((n, npol), dtype = complex)
+                for ipol in range(npol):
+                    dot = np.sum(nvec * a[:, :, ipol], axis = 1)
+                    result[:, ipol] = dot * eps
+                return result
+        elif not isinstance(a, np.ndarray) and a == 0:
+            return 0
+        else:
+            return 0
+
+    def _matmul_eps(self,
+            eps: np.ndarray,
+            phi_p: Any) -> Any:
+
+        if isinstance(phi_p, np.ndarray):
+            if phi_p.ndim == 1:
+                return eps * phi_p
+            else:
+                return eps[:, np.newaxis] * phi_p
+        elif phi_p == 0:
+            return 0
+        else:
+            return eps * phi_p
+
+    def solve(self,
+            exc: Any) -> Tuple[CompStruct, 'BEMRetLayer']:
+
+        enei = exc.enei if hasattr(exc, 'enei') else exc['enei']
+        self.init(enei)
+
+        phi, a, alpha, De = self._excitation(exc)
+
+        k = self.k
+        nvec = self.nvec
+        npar = self.npar
+        nperp = self.nperp
+        L1 = self.L1
+        L2p = self.L2p
+        G1i = self.G1i
+        G2pi = self.G2pi
+        G2 = self.G2
+        G2e = self.G2e
+        Sigma1 = self.Sigma1
+        Sigma1e = self.Sigma1e
+        Gamma = self.Gamma
+        m_lu = self.m_lu
+
+        nfaces = self.p.nfaces if hasattr(self.p, 'nfaces') else self.p.n
+
+        # Ensure proper shapes
+        if not isinstance(phi, np.ndarray) or phi.size == 0:
+            phi = np.zeros(nfaces, dtype = complex)
+        if not isinstance(a, np.ndarray) or a.size == 0:
+            a = np.zeros((nfaces, 3), dtype = complex)
+        if not isinstance(alpha, np.ndarray):
+            alpha = np.zeros((nfaces, 3), dtype = complex)
+        if not isinstance(De, np.ndarray):
+            De = np.zeros(nfaces, dtype = complex)
+
+        # Determine number of polarizations
+        npol = 1
+        if isinstance(a, np.ndarray) and a.ndim == 3:
+            npol = a.shape[2]
+        elif isinstance(alpha, np.ndarray) and alpha.ndim == 3:
+            npol = alpha.shape[2]
+        elif isinstance(phi, np.ndarray) and phi.ndim == 2:
+            npol = phi.shape[1]
+        elif isinstance(De, np.ndarray) and De.ndim == 2:
+            npol = De.shape[1]
+
+        if npol == 1:
+            if isinstance(a, np.ndarray) and a.ndim == 3:
+                a = a[:, :, 0]
+            if isinstance(alpha, np.ndarray) and alpha.ndim == 3:
+                alpha = alpha[:, :, 0]
+            if isinstance(phi, np.ndarray) and phi.ndim == 2:
+                phi = phi[:, 0]
+            if isinstance(De, np.ndarray) and De.ndim == 2:
+                De = De[:, 0]
+
+        n = nfaces
+
+        # Unit vector in z-direction
+        zunit = np.zeros((n, 3))
+        zunit[:, 2] = 1.0
+
+        m_full = self.m_full
+
+        if npol == 1:
+            sig1, sig2, h1, h2 = self._solve_single(
+                phi, a, alpha, De, k, n, nvec, npar, nperp, zunit,
+                L1, L2p, G1i, G2pi, G2, G2e, Sigma1, Sigma1e, Gamma,
+                m_lu, m_full)
+        else:
+            sig1 = np.zeros((n, npol), dtype = complex)
+            sig2 = np.zeros((n, npol), dtype = complex)
+            h1 = np.zeros((n, 3, npol), dtype = complex)
+            h2 = np.zeros((n, 3, npol), dtype = complex)
+
+            for ipol in range(npol):
+                phi_i = phi[:, ipol] if phi.ndim > 1 else phi
+                a_i = a[:, :, ipol] if a.ndim > 2 else a
+                alpha_i = alpha[:, :, ipol] if alpha.ndim > 2 else alpha
+                De_i = De[:, ipol] if De.ndim > 1 else De
+
+                s1, s2, hh1, hh2 = self._solve_single(
+                    phi_i, a_i, alpha_i, De_i, k, n, nvec, npar, nperp, zunit,
+                    L1, L2p, G1i, G2pi, G2, G2e, Sigma1, Sigma1e, Gamma,
+                    m_lu, m_full)
+
+                sig1[:, ipol] = s1
+                sig2[:, ipol] = s2
+                h1[:, :, ipol] = hh1
+                h2[:, :, ipol] = hh2
+
+        # Host-materialize before returning to user.
+        if is_cupy_array(sig1):
+            sig1 = to_host(sig1)
+        if is_cupy_array(sig2):
+            sig2 = to_host(sig2)
+        if is_cupy_array(h1):
+            h1 = to_host(h1)
+        if is_cupy_array(h2):
+            h2 = to_host(h2)
+
+        # free any cupy LU-solve scratch buffers allocated during
+        # the per-polarization _solve_single calls (each polarization
+        # allocates a 2n RHS + GEMM scratch).  Without this the solve-side
+        # pool can balloon by N^2 per wavelength on multi-polarization
+        # sweeps even when init() is cached.
+        if _CUPY_OK_V172:
+            try:
+                _cp_v172.cuda.runtime.deviceSynchronize()
+                _cp_v172.get_default_memory_pool().free_all_blocks()
+            except Exception:
+                pass
+
+        sig = CompStruct(self.p, enei, sig1 = sig1, sig2 = sig2,
+            h1 = h1, h2 = h2)
+
+        return sig, self
+
+    def _solve_single(self,
+            phi: np.ndarray,
+            a: np.ndarray,
+            alpha: np.ndarray,
+            De: np.ndarray,
+            k: float,
+            n: int,
+            nvec: np.ndarray,
+            npar: np.ndarray,
+            nperp: np.ndarray,
+            zunit: np.ndarray,
+            L1: np.ndarray,
+            L2p: np.ndarray,
+            G1i: np.ndarray,
+            G2pi: np.ndarray,
+            G2: Dict[str, Any],
+            G2e: Dict[str, Any],
+            Sigma1: np.ndarray,
+            Sigma1e: np.ndarray,
+            Gamma: np.ndarray,
+            m_lu: Any,
+            m_full: Any = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+
+        _sv_t0 = _prof_mark('solve.enter', _time.perf_counter(), None)
+
+        # MATLAB mldivide.m: Decompose vector potential into parallel and perpendicular
+        aperp = _inner(zunit, a)  # (n,)
+        apar = a - _outer(zunit, aperp)  # (n, 3)
+
+        # MATLAB: alpha = alpha - matmul(Sigma1, a) + ik * outer(nvec, matmul(L1, phi))
+        alpha = alpha - _matmul(Sigma1, a) + 1j * k * _outer(nvec, _matmul(L1, phi))
+
+        # MATLAB: De = De - matmul(Sigma1e, phi) + ik*inner(nvec, matmul(L1, a))
+        #             + ik*inner(npar, matmul((L1-L2p)*Gamma, alpha))
+        # (L1 - L2p) @ Gamma is a constant (n,n) matrix per wavelength;
+        # cache it in init() (self._sv_L1mL2p_Gamma) instead of recomputing the
+        # host c128 GEMM once per polarisation.
+        L1mL2p_Gamma = getattr(self, '_sv_L1mL2p_Gamma', None)
+        if L1mL2p_Gamma is None:
+            L1mL2p_Gamma = (L1 - L2p) @ Gamma
+        De = (De
+            - _matmul(Sigma1e, phi)
+            + 1j * k * _inner(nvec, _matmul(L1, a))
+            + 1j * k * _inner(npar, _matmul(L1mL2p_Gamma, alpha)))
+
+        # Decompose alpha into parallel and perpendicular
+        alphaperp = _inner(zunit, alpha)  # (n,)
+        alphapar = alpha - _outer(zunit, alphaperp)  # (n, 3)
+        _sv_t0 = _prof_mark('solve.rhs-build (Sigma/L1 GEMV)', _sv_t0, None)
+
+        # Solve 2x2 block matrix equation: [sig2; h2perp] = m \ [De; alphaperp]
+        rhs = np.empty(2 * n, dtype = complex)
+        rhs[:n] = De
+        rhs[n:] = alphaperp
+
+        if self.use_matlab_engine and m_full is not None:
+            from .matlab_bem import matlab_solve
+            xi2 = matlab_solve(m_full, rhs)
+        else:
+            # Also accept the ('mgpu', ...) tag produced by
+            # the distributed-build path -- ``lu_solve_dispatch`` knows how
+            # to route the cuSolverMg distributed solve.
+            if (isinstance(m_lu, tuple) and len(m_lu) == 3
+                    and m_lu[0] in ("cpu", "gpu", "mgpu")):
+                xi2 = lu_solve_dispatch(m_lu, rhs)
+            else:
+                xi2 = lu_solve(m_lu, rhs, check_finite=False, overwrite_b=True)
+        sig2 = xi2[:n]
+        h2perp = xi2[n:]
+        _sv_t0 = _prof_mark('solve.m_full-LU-backsub', _sv_t0, None)
+
+        # Parallel component of surface current (MATLAB mldivide.m line 60-62)
+        # h2par = matmul(G2pi*Gamma, alphapar + ik*outer(npar,
+        #           matmul(L1*G2.ss - G2e.ss, sig2) + matmul(L1*G2.sh - G2e.sh, h2perp)))
+        # diff_ss/diff_sh/G2pi@Gamma are constant per wavelength and are
+        # built once in init() (self._sv_*); reuse the cache to skip 3 large
+        # GEMMs per polarisation.  Fall back to recompute if init() didn't run
+        # through the cached path.
+        diff_ss = getattr(self, '_sv_diff_ss', None)
+        diff_sh = getattr(self, '_sv_diff_sh', None)
+        G2piGamma = getattr(self, '_sv_G2piGamma', None)
+        if diff_ss is None:
+            diff_ss = matmul_dispatch(L1, G2['ss']) - G2e['ss']
+        if diff_sh is None:
+            diff_sh = matmul_dispatch(L1, G2['sh']) - G2e['sh']
+        if G2piGamma is None:
+            G2piGamma = matmul_dispatch(G2pi, Gamma)
+        inner_par = _matmul(diff_ss, sig2) + _matmul(diff_sh, h2perp)
+        h2par = _matmul(G2piGamma, alphapar + 1j * k * _outer(npar, inner_par))
+        _sv_t0 = _prof_mark('solve.h2par (3x nxn GEMM)', _sv_t0, None)
+
+        # Surface current h2 = h2par + outer(zunit, h2perp)
+        h2 = h2par + _outer(zunit, h2perp)
+
+        # Surface charges at inner interface (MATLAB mldivide.m line 67)
+        # sig1 = matmul(G1i, matmul(G2.ss, sig2) + matmul(G2.sh, h2perp) + phi)
+        sig1 = _matmul(G1i, _matmul(G2['ss'], sig2) + _matmul(G2['sh'], h2perp) + phi)
+
+        # Surface currents at inner interface (MATLAB mldivide.m lines 69-71)
+        # h1perp = matmul(G1i, matmul(G2.hs, sig2) + matmul(G2.hh, h2perp) + aperp)
+        h1perp = _matmul(G1i, _matmul(G2['hs'], sig2) + _matmul(G2['hh'], h2perp) + aperp)
+        # h1par = matmul(G1i, matmul(G2.p, h2par) + apar)
+        h1par = _matmul(G1i, _matmul(G2['p'], h2par) + apar)
+        # h1 = h1par + outer(zunit, h1perp)
+        h1 = h1par + _outer(zunit, h1perp)
+        _sv_t0 = _prof_mark('solve.sig1/h1 (G1i/G2 GEMV)', _sv_t0, None)
+
+        return sig1, sig2, h1, h2
+
+    def __truediv__(self,
+            exc: Any) -> Tuple[CompStruct, 'BEMRetLayer']:
+
+        return self.solve(exc)
+
+    def __mul__(self,
+            sig: Any) -> CompStruct:
+
+        pot1 = self.potential(sig, 1)
+        pot2 = self.potential(sig, 2)
+
+        enei = sig.enei if hasattr(sig, 'enei') else sig['enei']
+
+        return CompStruct(self.p, enei,
+            phi1 = pot1.phi1, phi1p = pot1.phi1p,
+            a1 = pot1.a1, a1p = pot1.a1p,
+            phi2 = pot2.phi2, phi2p = pot2.phi2p,
+            a2 = pot2.a2, a2p = pot2.a2p)
+
+    def potential(self,
+            sig: Any,
+            inout: int = 2) -> CompStruct:
+
+        return self.g.potential(sig, inout)
+
+    def field(self,
+            sig: Any,
+            inout: int = 2) -> CompStruct:
+
+        return self.g.field(sig, inout)
+
+    def setup_tabulation(self, nr = 30, nz = 20):
+
+        if self.g is None:
+            self.g = CompGreenRetLayer(self.p, self.p, self.layer, **self.options)
+        self.g.setup_tabulation(nr = nr, nz = nz)
+
+    # ------------------------------------------------------------------
+    # Distributed build path
+    # ------------------------------------------------------------------
+
+    def _build_greens_chunked(self, enei, chunk_cols):
+        # Column-chunked build of the init Green matrices via eval_block: each
+        # chunk's columns are built on GPU then moved to host, so the device
+        # peak is one chunk (N x chunk) instead of the full N^2. gr (reflected)
+        # is recomputed once per chunk (cached by (enei, col_range) in
+        # GreenRetLayer) and reused across the outer-surface keys within a chunk.
+        n = self.p.n
+        chunk = max(1, min(int(chunk_cols), n))
+        # Under MNPBEM_GPU_LOWPREC hold the init Green buffers in complex64 so
+        # the downstream distributed dense LU factorises in fp32 (the A6000's
+        # fp64 throughput is ~1/16 of fp32: a 22560^2 factor is ~66 s in c128
+        # vs ~7 s in c64) and the host buffers take half the RAM.  eval_block
+        # still evaluates each chunk in c128 on the GPU; the assignment below
+        # downcasts on the way to host.
+        _gwd = np.complex64 if os.environ.get('MNPBEM_GPU_LOWPREC', '0') == '1' else complex
+        G11 = np.empty((n, n), dtype = _gwd)
+        G21 = np.empty((n, n), dtype = _gwd)
+        H11 = np.empty((n, n), dtype = _gwd)
+        H21 = np.empty((n, n), dtype = _gwd)
+        G12 = np.empty((n, n), dtype = _gwd)
+        H12 = np.empty((n, n), dtype = _gwd)
+        G22 = None
+        H22 = None
+        for c0 in range(0, n, chunk):
+            c1 = min(c0 + chunk, n)
+            G11[:, c0:c1] = to_host(self.g.eval_block(0, 0, 'G', enei, c0, c1))
+            G21[:, c0:c1] = to_host(self.g.eval_block(1, 0, 'G', enei, c0, c1))
+            H11[:, c0:c1] = to_host(self.g.eval_block(0, 0, 'H1', enei, c0, c1))
+            H21[:, c0:c1] = to_host(self.g.eval_block(1, 0, 'H1', enei, c0, c1))
+            g22 = self.g.eval_block(1, 1, 'G', enei, c0, c1)
+            h22 = self.g.eval_block(1, 1, 'H2', enei, c0, c1)
+            if G22 is None:
+                G22 = {k: np.empty((n, n), dtype = _gwd) for k in g22}
+                H22 = {k: np.empty((n, n), dtype = _gwd) for k in h22}
+            for k in g22:
+                G22[k][:, c0:c1] = to_host(g22[k])
+            for k in h22:
+                H22[k][:, c0:c1] = to_host(h22[k])
+            G12[:, c0:c1] = to_host(self.g.eval_block(0, 1, 'G', enei, c0, c1))
+            H12[:, c0:c1] = to_host(self.g.eval_block(0, 1, 'H2', enei, c0, c1))
+            try:
+                _cp_v172.get_default_memory_pool().free_all_blocks()
+            except Exception:
+                pass
+        return G11, G21, H11, H21, G22, G12, H22, H12
+
+    def _init_distributed_precond(self, enei: float) -> 'BEMRetLayer':
+        """Distributed BEM build for the substrate (layer) solver.
+
+        Mirrors :meth:`init` but routes every dense N^2 matrix through
+        ``DistributedMatrix`` so the host never holds more than one of
+        them at a time.  Each per-GPU tile carries the column slice of
+        the global matrix that ``cusolverMg`` will end up owning, so the
+        LU factor consumes the distributed buffers in place.
+
+        Layout choices
+        --------------
+        - The ``2n x 2n`` block-response matrix ``m_full`` is built as a
+          single :class:`DistributedMatrix` (column block-cyclic across N
+          GPUs).  Its LU factor uses the existing ``('mgpu', ...)`` tag.
+        - The auxiliary scalar-Green N x N matrices (``G1``, ``G2.p``,
+          ``Gamma = Sigma1 - Sigma2p``) are also block-cyclically
+          distributed for their LU factors.
+        - The structured-Green block dict (``G2``, ``G2e``, ``H2``,
+          ``H2e``) is built once on the host (the layer Sommerfeld table
+          assembly is intrinsically per-wavelength CPU-bound; columnar
+          distribution would not save host memory because the tile
+          callback would still need the table per call).  Each
+          structured component is materialized one at a time so peak
+          host residency stays at a single ``N^2`` complex buffer.
+
+        Numerical contract
+        ------------------
+        The combined matrices ``m11..m22`` and ``Gamma``/``Sigma`` are
+        the same products as the legacy path -- only the storage class
+        changes.  cuBLAS / cuSolverMg differ from MKL by floating-point
+        rounding bounded by ``N * eps_machine`` (~1e-12 for dimer-scale
+        meshes), well below the BEM solver's downstream tolerance.
+        """
+
+        from ..utils.distributed_matrix import DistributedMatrix
+
+        cp = _cp_v172
+        dist_kw = _vram_share_distributed_kwargs()
+        n_gpus = int(dist_kw['n_gpus'])
+        device_ids = dist_kw['device_ids']
+        block_size = int(dist_kw['block_size'])
+
+        # ---- Per-wavelength fragmentation cleanup (same as legacy) ----
+        # Close cuSolverMg handles from the previous wavelength FIRST so
+        # the next factor() calls do not collide with stale state.
+        for _attr in ('_G1_lu', '_G2p_lu', '_Gamma_lu', 'm_lu'):
+            _entry = getattr(self, _attr, None)
+            if isinstance(_entry, tuple) and len(_entry) == 3 and _entry[0] == 'mgpu':
+                try:
+                    _entry[1].close()
+                except Exception:
+                    pass
+        # Release the matching distributed buffers (kept the LU pointers).
+        for _attr in ('_G1_dm', '_G2p_dm', '_Gamma_dm', '_m_full_dm'):
+            _dm = getattr(self, _attr, None)
+            if _dm is not None:
+                try:
+                    _dm.free()
+                except Exception:
+                    pass
+            setattr(self, _attr, None)
+        for _attr in ('_G1_lu', '_G2p_lu', '_Gamma_lu', 'm_lu',
+                      'G1i', 'G2pi', 'G2', 'G2e',
+                      'L1', 'L2p', 'Sigma1', 'Sigma1e', 'Gamma',
+                      'm_full',
+                      '_sv_diff_ss', '_sv_diff_sh', '_sv_G2piGamma',
+                      '_sv_L1mL2p_Gamma'):
+            if hasattr(self, _attr):
+                setattr(self, _attr, None)
+        # Drop the reflected-Green per-component caches on self.g.gr the same
+        # way the legacy init does (lines ~474-490).  GreenRetLayer.eval_components
+        # stashes G_comp/F_comp/Gp_comp (and the scalar G/F/Gp) keyed on the
+        # previous wavelength; the distributed path never cleared them, so they
+        # accumulated across the sweep (host RSS, and any cupy-native entries on
+        # the GPU) and contributed to the wl~12 OOM on 22560.  Reset _gr.enei so
+        # the next eval_components rebuilds cleanly.
+        _gr = getattr(getattr(self, 'g', None), 'gr', None)
+        if _gr is not None:
+            for _gr_attr in ('G_comp', 'F_comp', 'Gp_comp', 'G', 'F', 'Gp'):
+                if hasattr(_gr, _gr_attr):
+                    setattr(_gr, _gr_attr, None)
+            if hasattr(_gr, 'enei'):
+                _gr.enei = None
+        try:
+            _pool_limit_gb = float(
+                os.environ.get('MNPBEM_GPU_POOL_LIMIT_GB', '0')
+            )
+        except (TypeError, ValueError):
+            _pool_limit_gb = 0.0
+        try:
+            _mempool = cp.get_default_memory_pool()
+            if _pool_limit_gb > 0:
+                _mempool.set_limit(size=int(_pool_limit_gb * (1024 ** 3)))
+            import gc as _gc
+            _gc.collect()
+            # Free the previous wavelength's device buffers on EVERY device,
+            # not just the current one.  The single-GPU LU factors — above all
+            # ``m_lu`` (the 2N x 2N m_full factor, ~16 GB at 22560 in c64) —
+            # live on the last device (_lu_dev); a current-device-only
+            # free_all_blocks leaves that ~16 GB pinned there, so the next
+            # wavelength's m_full allocation OOMs on the 2nd wavelength of a
+            # sweep even though wavelength 1 fit.
+            _cur_dev = cp.cuda.runtime.getDevice()
+            _clean_devs = list(device_ids) if device_ids else list(range(n_gpus))
+            for _dev in _clean_devs:
+                try:
+                    cp.cuda.runtime.setDevice(int(_dev))
+                    cp.cuda.runtime.deviceSynchronize()
+                    cp.get_default_memory_pool().free_all_blocks()
+                    cp.get_default_pinned_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
+            try:
+                cp.cuda.runtime.setDevice(int(_cur_dev))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        # Per-wavelength device-memory trace (gated on MNPBEM_INIT_PROFILE): the
+        # used_bytes on each device right AFTER the cleanup, so a rising trend
+        # across wavelengths exposes any residual leak that survived the free.
+        if _init_profile_enabled():
+            try:
+                _um = []
+                for _d in (device_ids if device_ids else list(range(n_gpus))):
+                    with cp.cuda.Device(int(_d)):
+                        _um.append('{}:{:.2f}GB'.format(
+                            _d, cp.get_default_memory_pool().used_bytes() / 1e9))
+                print('[init-prof] post-clean dev-used {}'.format(' '.join(_um)),
+                      flush=True)
+            except Exception:
+                pass
+
+        self.enei = enei
+
+        # Outer surface normals
+        nvec = self.p.nvec
+        self.nvec = nvec
+        nperp = nvec[:, 2]
+        npar = nvec.copy()
+        npar[:, 2] = 0.0
+        self.npar = npar
+        self.nperp = nperp
+
+        # Wavenumber in vacuum
+        k = 2 * np.pi / enei
+        self.k = k
+
+        # Dielectric function values
+        eps1_vals = self.p.eps1(enei)
+        eps2_vals = self.p.eps2(enei)
+        if np.allclose(eps1_vals, eps1_vals[0]) and np.allclose(eps2_vals, eps2_vals[0]):
+            eps1 = eps1_vals[0]
+            eps2 = eps2_vals[0]
+        else:
+            eps1 = np.diag(eps1_vals)
+            eps2 = np.diag(eps2_vals)
+        self.eps1 = eps1
+        self.eps2 = eps2
+
+        # Green-function object: build once
+        if self.g is None:
+            opts = dict(self.options)
+            if self.greentab is not None:
+                gt = self.greentab
+                if hasattr(gt, 'tab'):
+                    opts['greentab_obj'] = gt.tab
+                elif hasattr(gt, 'r'):
+                    opts['greentab_obj'] = gt
+            self.g = CompGreenRetLayer(self.p, self.p, self.layer, **opts)
+
+        import time as _dprof_time
+        _dprof_t0 = _prof_mark('dist.setup', _dprof_time.perf_counter(), None)
+
+        # ---- Green build (column-chunked; GPU peak = one chunk) ----
+        _chunk = int(os.environ.get('MNPBEM_GREEN_CHUNK_COLS', '2048'))
+        (G11, G21, H11, H21,
+                G22, G12, H22, H12) = self._build_greens_chunked(enei, _chunk)
+        _dprof_t0 = _prof_mark('dist.green-build', _dprof_t0, None)
+
+        G1 = self._sub_mat(G11, G21)
+        G1e = self._sub_mat(self._mul_eps(eps1, G11), self._mul_eps(eps2, G21))
+        H1 = self._sub_mat(H11, H21)
+        H1e = self._sub_mat(self._mul_eps(eps1, H11), self._mul_eps(eps2, H21))
+        del G11, G21, H11, H21
+        try:
+            cp.cuda.runtime.deviceSynchronize()
+            cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+
+        G2 = self._build_outer_mixed(G22, G12)
+        H2 = self._build_outer_mixed(H22, H12)
+        G2e = self._build_outer_mixed_eps(G22, G12, eps2, eps1)
+        H2e = self._build_outer_mixed_eps(H22, H12, eps2, eps1)
+        del G22, G12, H22, H12
+        _dprof_t0 = _prof_mark('dist.outer-mixed', _dprof_t0, None)
+        try:
+            cp.cuda.runtime.deviceSynchronize()
+            cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+
+        n = G1.shape[0]
+
+        # The distributed green build + outer-mixed leave large cupy pool
+        # blocks resident on every device (~27 GB on device 0 at 22560 faces).
+        # Release them on all devices before the single-GPU factors below, or
+        # the LU device is driven into memory-pool thrashing that turns a
+        # ~14 s inverse into a multi-hour hang.  Every matrix the LUs consume
+        # already lives on the host at this point, so this frees only stale
+        # scratch.
+        for _dev in (device_ids or list(range(n_gpus))):
+            try:
+                cp.cuda.runtime.setDevice(int(_dev))
+                cp.cuda.runtime.deviceSynchronize()
+                cp.get_default_memory_pool().free_all_blocks()
+                cp.get_default_pinned_memory_pool().free_all_blocks()
+            except Exception:
+                pass
+        # Run the per-matrix single-GPU LUs on a device that is NOT holding the
+        # green build's residual pool.  lu_solve_dispatch returns host arrays,
+        # so the downstream numpy '@' assembly is unaffected by the LU device.
+        _dev_list = list(device_ids) if device_ids else list(range(n_gpus))
+        _lu_dev = _dev_list[-1] if len(_dev_list) > 1 else _dev_list[0]
+        try:
+            cp.cuda.runtime.setDevice(int(_lu_dev))
+        except Exception:
+            pass
+
+        # ============================================================
+        # Step 1: single-GPU LU of G1 + full inverse (n_gpus=1 overrides env).
+        # ============================================================
+        _g1dt = G1.dtype
+        _G1h = to_host(G1) if is_cupy_array(G1) else G1
+        _G1h = np.ascontiguousarray(_G1h)
+        self._G1_lu = lu_factor_dispatch(_G1h, n_gpus=1)
+        self._G1_dm = None
+        del G1, _G1h
+        G1i = lu_solve_dispatch(self._G1_lu, np.eye(n, dtype=_g1dt))
+        _dprof_t0 = _prof_mark('dist.G1-LU+inv', _dprof_t0, None)
+
+        # ============================================================
+        # Step 2: distributed LU of G2.p (substrate parallel block)
+        # ============================================================
+        G2p = G2['p']
+        _g2dt = G2p.dtype
+        self._G2p_lu = lu_factor_dispatch(np.ascontiguousarray(G2p), n_gpus=1)
+        self._G2p_dm = None
+        del G2p
+        G2pi = lu_solve_dispatch(self._G2p_lu, np.eye(n, dtype=_g2dt))
+
+        # ============================================================
+        # Step 3: Sigma / L matrices on host (structured G2 dict)
+        # ============================================================
+        _dprof_t0 = _prof_mark('dist.G2p-LU+inv', _dprof_t0, None)
+        Sigma1 = H1 @ G1i
+        Sigma1e = H1e @ G1i
+        Sigma2p = H2['p'] @ G2pi
+        L1 = G1e @ G1i
+        L2p = G2e['p'] @ G2pi
+        del H1, H1e, G1e
+        _dprof_t0 = _prof_mark('dist.Sigma/L-GEMM', _dprof_t0, None)
+
+        # ============================================================
+        # Step 4: distributed LU of Gamma = Sigma1 - Sigma2p
+        # ============================================================
+        Gamma_host = np.ascontiguousarray(Sigma1 - Sigma2p)
+        del Sigma2p
+        self._Gamma_lu = lu_factor_dispatch(np.ascontiguousarray(Gamma_host), n_gpus=1)
+        self._Gamma_dm = None
+        Gamma = lu_solve_dispatch(self._Gamma_lu, np.eye(n, dtype=Gamma_host.dtype))
+        del Gamma_host
+        _dprof_t0 = _prof_mark('dist.Gamma-LU+inv', _dprof_t0, None)
+
+        # Gammapar = ik*(L1-L2p)*Gamma .* (npar*npar')
+        # Kept on numpy: the chained complex*complex product here rounds
+        # ~1 ULP differently under numba (max rel ~1.5e-16), which would
+        # violate the bit-identical (max rel = 0) contract this build holds.
+        npar_outer = npar @ npar.T
+        Gammapar = 1j * k * ((L1 - L2p) @ Gamma) * npar_outer
+        # LOWPREC: the 1j*k scalar promotes complex64 back to complex128; pull it
+        # down so the m-assembly GEMMs and the 2N×2N m_full LU stay fp32.
+        if os.environ.get('MNPBEM_GPU_LOWPREC', '0') == '1':
+            Gammapar = Gammapar.astype(np.complex64)
+        del npar_outer
+
+        # ============================================================
+        # Step 5: assemble the 2n x 2n block matrix on host then scatter
+        # ============================================================
+        # We allocate m_full on the host (single 4*N^2 complex buffer)
+        # before the structured-G2 ``diff_*`` intermediates are released,
+        # which is the same peak as the legacy path.  The DistributedMatrix
+        # then scatters columns block-cyclic and the host copy is freed
+        # immediately so subsequent wavelengths do not double-occupy.
+        #
+        # Every ``@`` below is a dense N^2 GEMM handled by MKL; only the
+        # trailing subtractions / ik-scaling / nperp-broadcast (no matmul,
+        # so MKL threads never touch them) move to the numba-parallel
+        # element-wise kernels.  Subtraction and scaling carry no
+        # reassociation, so the fused kernels are bit-identical to the
+        # numpy expressions they replace (verified max rel err = 0, fp64).
+        diff_ss = _bem_elem.sub2(L1 @ G2['ss'], G2e['ss'])
+        diff_sh = _bem_elem.sub2(L1 @ G2['sh'], G2e['sh'])
+        diff_hh = _bem_elem.sub2(L1 @ G2['hh'], G2e['hh'])
+
+        m11 = _bem_elem.m_full_block(
+            Sigma1e @ G2['ss'], H2e['ss'], Gammapar @ diff_ss, diff_sh, nperp, k)
+        m12 = _bem_elem.m_full_block(
+            Sigma1e @ G2['sh'], H2e['sh'], Gammapar @ diff_sh, diff_hh, nperp, k)
+        m21 = _bem_elem.m_half_block(
+            Sigma1 @ G2['hs'], H2['hs'], diff_ss, nperp, k)
+        m22 = _bem_elem.m_half_block(
+            Sigma1 @ G2['hh'], H2['hh'], diff_sh, nperp, k)
+        del diff_ss, diff_sh, diff_hh, Gammapar, H2, H2e
+
+        _mf_dtype = (np.complex64
+                if os.environ.get('MNPBEM_GPU_LOWPREC', '0') == '1' else complex)
+        m_full = np.empty((2 * n, 2 * n), dtype=_mf_dtype)
+        m_full[:n, :n] = m11
+        m_full[:n, n:] = m12
+        m_full[n:, :n] = m21
+        m_full[n:, n:] = m22
+        del m11, m12, m21, m22
+        _dprof_t0 = _prof_mark('dist.m-assemble-GEMM', _dprof_t0, None)
+
+        # Free the per-block GPU inverses before the 2N×2N factor so the
+        # single device has room for m_full (c64: 16 GB, c128: 32 GB).
+        self._G1_lu = None
+        self._G2p_lu = None
+        self._Gamma_lu = None
+        try:
+            cp.cuda.runtime.deviceSynchronize()
+            cp.get_default_memory_pool().free_all_blocks()
+            cp.get_default_pinned_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+
+        # Single-GPU LU of the 2N×2N system matrix (n_gpus=1). _solve_single
+        # consumes self.m_lu through lu_solve_dispatch, which already handles
+        # the ('gpu', lu, piv) tag with the LOWPREC dtype bridging.
+        self.m_lu = lu_factor_dispatch(np.ascontiguousarray(m_full), n_gpus=1)
+        self.m_full = None
+        self._m_full_dm = None
+        del m_full  # host copy freed
+        _dprof_t0 = _prof_mark('dist.m_full-LU(2Nx2N)', _dprof_t0, None)
+
+        # Store auxiliary matrices on host (same as legacy path) so
+        # ``_solve_single`` can reuse the existing numpy code path.
+        self.G1i = G1i
+        self.G2pi = G2pi
+        self.G2 = G2
+        self.G2e = G2e
+        self.L1 = L1
+        self.L2p = L2p
+        self.Sigma1 = Sigma1
+        self.Sigma1e = Sigma1e
+        self.Gamma = Gamma
+
+        # solve-side constant GEMM cache. Same as the standard init (lines 891-926) — distributed
+        # init; if omitted here, _solve_single diverges the spectrum via stale/undefined _sv_*
+        # (a bug that was missing when wiring the green split).
+        self._sv_diff_ss = matmul_dispatch(L1, G2['ss']) - G2e['ss']
+        self._sv_diff_sh = matmul_dispatch(L1, G2['sh']) - G2e['sh']
+        self._sv_G2piGamma = matmul_dispatch(G2pi, Gamma)
+        self._sv_L1mL2p_Gamma = matmul_dispatch(L1 - L2p, Gamma)
+        for _svn in ('_sv_diff_ss', '_sv_diff_sh', '_sv_G2piGamma', '_sv_L1mL2p_Gamma'):
+            if is_cupy_array(getattr(self, _svn)):
+                setattr(self, _svn, to_host(getattr(self, _svn)))
+
+        # Sync ALL devices in the distributed grid before returning.
+        # cuSolverMg leaves async work queued on each device and the next
+        # ``solve()`` (running on a different handle) can otherwise see
+        # half-written descriptors and fail with status 6.
+        try:
+            for _dev in (device_ids or list(range(n_gpus))):
+                try:
+                    cp.cuda.runtime.setDevice(int(_dev))
+                    cp.cuda.runtime.deviceSynchronize()
+                    cp.get_default_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
+            cp.cuda.runtime.setDevice(int((device_ids or [0])[0]))
+            cp.get_default_pinned_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+        return self
+
+    def clear(self) -> 'BEMRetLayer':
+
+        self.L1 = None
+        self.L2p = None
+        self.G1i = None
+        self.G2pi = None
+        self.G2 = None
+        self.G2e = None
+        self.Sigma1 = None
+        self.Sigma1e = None
+        self.Gamma = None
+        self.m_lu = None
+        self.m_full = None
+        self._G1_lu = None
+        self._G2p_lu = None
+        self._Gamma_lu = None
+        # Release distributed buffers when present.
+        for _attr in ('_G1_dm', '_G2p_dm', '_Gamma_dm', '_m_full_dm'):
+            _dm = getattr(self, _attr, None)
+            if _dm is not None:
+                try:
+                    _dm.free()
+                except Exception:
+                    pass
+                setattr(self, _attr, None)
+        self.enei = None
+        return self
+
+    def __call__(self,
+            enei: float) -> 'BEMRetLayer':
+
+        return self.init(enei)
+
+    def __repr__(self) -> str:
+        status = 'enei={:.1f}nm'.format(self.enei) if self.enei is not None else 'not initialized'
+        n = self.p.nfaces if hasattr(self.p, 'nfaces') else self.p.n if hasattr(self.p, 'n') else '?'
+        return 'BEMRetLayer(p: {} faces, {})'.format(n, status)
