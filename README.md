@@ -1,6 +1,6 @@
 # PyMNPBEM v1.0.0
 
-Python port of the [MATLAB MNPBEM toolbox](https://physik.uni-graz.at/de/mnpbem/)
+Python port of the [MATLAB MNPBEM toolbox](https://github.com/Nikolaos-Matthaiakakis/MNPBEM)
 (Hohenester & Trügler) for the simulation of electromagnetic properties of
 metallic nanoparticles using the boundary element method (BEM).
 
