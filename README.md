@@ -101,7 +101,7 @@ examples/                # Runnable Python examples + Jupyter tutorial
 ```
 
 > The original MATLAB MNPBEM17 toolbox is **not** bundled here. It is available
-> from the [author's site](https://physik.uni-graz.at/de/mnpbem/).
+> from the [author's site](https://github.com/Nikolaos-Matthaiakakis/MNPBEM).
 
 ## License
 
