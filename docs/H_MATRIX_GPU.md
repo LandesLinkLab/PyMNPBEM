@@ -1,4 +1,4 @@
-# H-matrix GPU acceleration — design doc
+# H-matrix GPU acceleration - design doc
 
 Status: **prototype landed**, production integration deferred.
 
@@ -24,11 +24,11 @@ the larger-mesh use case becomes the bottleneck.
 
 * An earlier step added a numba CPU ACA path
   (`mnpbem.greenfun.hmatrix.HMatrix`) plus the
-  `aca_compgreen_*` wrappers.  Compression is excellent at >5k faces
+  `aca_compgreen_*` wrappers. Compression is excellent at >5k faces
   (1-3 % ratio for the static kernel, 10-20 % for retarded with
   k-aware admissibility).
 * Running the H-matrix **on GPU** is the scaling story for meshes around
-  50 k faces.  This document covers the implementation.
+  50 k faces. This document covers the implementation.
 
 ## Library survey
 
@@ -53,17 +53,17 @@ mnpbem/greenfun/
 ```
 
 * `aca_gpu.aca_block_gpu(fun, rows, cols, htol, kmax)` is the only
-  numerical routine that touches cupy.  Signature matches
+  numerical routine that touches cupy. Signature matches
   `HMatrix._aca_block` so swapping back-ends is mechanical.
-* `HMatrixGPU(HMatrix)` overrides `aca()`.  Everything else
+* `HMatrixGPU(HMatrix)` overrides `aca()`. Everything else
   (admissibility, dense blocks, `full`, `mtimes_vec`, `truncate`,
   `lu`, `solve`, `stat`, `plotrank`, ...) is inherited and runs on
-  the CPU.  Result: GPU acceleration costs **zero** test churn for
+  the CPU. Result: GPU acceleration costs **zero** test churn for
   downstream BEM code.
 
 ## Numerics
 
-* Same partially-pivoted ACA as the CPU path.  Pivot rule, Frobenius
+* Same partially-pivoted ACA as the CPU path. Pivot rule, Frobenius
   convergence test and Hermitian inner products for complex blocks
   are identical.
 * On a synthetic 1024-point cloud the GPU and CPU paths produce
@@ -73,7 +73,7 @@ mnpbem/greenfun/
 * On the 5768-face dimer the GPU vs CPU residual is **5.7e-17**, i.e.
   rounding only.
 
-## Performance — measured + projected
+## Performance - measured + projected
 
 Measured on the 5768-face dimer (RTX-class GPU, mnpbem env):
 
@@ -82,7 +82,7 @@ Measured on the 5768-face dimer (RTX-class GPU, mnpbem env):
 | CPU (numba) | 0.56 s    |
 | GPU (cupy)  | 9.86 s    |
 
-The GPU is ~18x slower at this size.  Reasons:
+The GPU is ~18x slower at this size. Reasons:
 
 1. Each ACA iteration calls the kernel **twice** (one row, one column).
    For dimer those are short (n=18..192 in our tree), and the cuBLAS
@@ -112,30 +112,30 @@ scale (253 MB dense vs 31 MB H, an ~8x reduction).
 
 ## Trade-offs / known limitations
 
-1. **Per-block launch overhead.**  The current loop is serial over
-   blocks.  Fixing this requires either streaming multiple blocks
+1. **Per-block launch overhead.** The current loop is serial over
+   blocks. Fixing this requires either streaming multiple blocks
    concurrently (cupy streams) or fusing the row/col residual updates
-   into a custom kernel.  Deferred.
-2. **Kernel-side data residency.**  When `fun(row, col)` reads from a
-   host numpy array we eat one h2d copy per iteration.  A follow-up should
+   into a custom kernel. Deferred.
+2. **Kernel-side data residency.** When `fun(row, col)` reads from a
+   host numpy array we eat one h2d copy per iteration. A follow-up should
    provide a `precompute_to_device(g)` helper that uploads
-   `g.G`, `g.F` once.  All BEM kernels expose dense numpy matrices
+   `g.G`, `g.F` once. All BEM kernels expose dense numpy matrices
    today so this is a small change.
-3. **Single GPU.**  No multi-device sharding; one block at a time.
+3. **Single GPU.** No multi-device sharding; one block at a time.
    For meshes beyond ~80 k faces a multi-stream scheduler will be
    needed.
-4. **GPU LU not implemented.**  The H-matrix `lu()` falls back to
-   dense (already true on CPU).  Once GPU becomes the fill bottleneck
+4. **GPU LU not implemented.** The H-matrix `lu()` falls back to
+   dense (already true on CPU). Once GPU becomes the fill bottleneck
    the dense LU will dominate at >25 k faces; cusolver `getrf` is the
    next obvious target.
-5. **No cupy = no test.**  CI machines without CUDA exercise only the
+5. **No cupy = no test.** CI machines without CUDA exercise only the
    CPU path; cupy is imported lazily so this is safe but coverage of
    `aca_gpu` requires a GPU runner.
 
 ## Integration plan with `BEMRet` / `ACACompGreen*`
 
 Today `aca_compgreen_stat.ACACompGreenStat` instantiates `HMatrix`
-directly.  The integration is one line:
+directly. The integration is one line:
 
 ```python
 # in aca_compgreen_stat.py
@@ -150,7 +150,7 @@ def _eval_single(self, key):
 ```
 
 with `use_gpu=True/False` exposed on the constructor and respecting
-the existing `MNPBEM_DISABLE_GPU=1` escape hatch.  The same pattern
+the existing `MNPBEM_DISABLE_GPU=1` escape hatch. The same pattern
 applies to `aca_compgreen_ret.py` and `aca_compgreen_ret_layer.py`.
 
 Natural next steps:
@@ -164,12 +164,12 @@ Natural next steps:
 
 ## Files
 
-* `mnpbem/greenfun/aca_gpu.py` — cupy ACA primitive
-* `mnpbem/greenfun/h_matrix_gpu.py` — HMatrixGPU + selftest
+* `mnpbem/greenfun/aca_gpu.py` - cupy ACA primitive
+* `mnpbem/greenfun/h_matrix_gpu.py` - HMatrixGPU + selftest
 
 ## Self-tests
 
-* `python -m mnpbem.greenfun.h_matrix_gpu` — synthetic 1024-point
+* `python -m mnpbem.greenfun.h_matrix_gpu` - synthetic 1024-point
   cloud, GPU vs CPU vs dense reference.
 * The 5768-face dimer reconstruction check quoted in the TL;DR table
   (12.3 % compression, 5.7e-17 relative Frobenius error).
