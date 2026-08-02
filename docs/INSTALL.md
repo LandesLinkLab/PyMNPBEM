@@ -1,7 +1,7 @@
 # Installation Guide
 
 This document covers every supported install path for the MNPBEM Python
-port — from a minimal CPU-only setup to a full multi-node, multi-GPU
+port - from a minimal CPU-only setup to a full multi-node, multi-GPU
 deployment.
 
 ## TL;DR
@@ -18,7 +18,7 @@ deployment.
 A single wheel ships every Python module. Optional extras only pull
 additional Python dependencies (cupy / mpi4py / fmm3dpy). The
 runtime auto-detects what is available and falls back to a pure NumPy
-path when GPU dependencies are missing — see Section "Runtime detection".
+path when GPU dependencies are missing - see Section "Runtime detection".
 
 ## 1. Prerequisites
 
@@ -32,7 +32,7 @@ path when GPU dependencies are missing — see Section "Runtime detection".
 
 The `[gpu]` extra installs `cupy-cuda12x`, which expects a working CUDA
 12 runtime on the host. CUDA 11.x environments need to install a
-matching `cupy-cuda11x` wheel manually — `pyproject.toml` does not pin
+matching `cupy-cuda11x` wheel manually - `pyproject.toml` does not pin
 that variant by default.
 
 ## 2. Recommended: conda environment
@@ -89,7 +89,7 @@ missing. Use the helper to verify what is active:
 from mnpbem.utils.gpu import has_gpu_capability, get_install_hint
 
 if has_gpu_capability(verbose=True):
-    print('GPU detected — set MNPBEM_GPU=1 to enable cupy dispatch')
+    print('GPU detected - set MNPBEM_GPU=1 to enable cupy dispatch')
 else:
     print('Running CPU-only')
     print(get_install_hint())
@@ -128,7 +128,7 @@ not have MATLAB installed.
 
 Multi-node MPI is detected automatically when the program is launched
 under `mpirun` / `srun` (mpi4py is imported from inside
-`mnpbem.utils.mpi_dispatch`). No env var toggle is required — single
+`mnpbem.utils.mpi_dispatch`). No env var toggle is required - single
 process simply behaves as `COMM_WORLD.size == 1`.
 
 ## 6. Verifying the install
@@ -182,7 +182,7 @@ mpirun -np 8 python my_spectrum.py
 srun -n 8 python my_spectrum.py
 ```
 
-The script does not need to import `mpi4py` directly — the package's
+The script does not need to import `mpi4py` directly - the package's
 internal dispatcher does so lazily. `pip install "mnpbem[mpi]"` is the
 only requirement.
 
@@ -192,7 +192,7 @@ only requirement.
 
 Either:
 1. `pip install "mnpbem[gpu]"` to add cupy to the active environment.
-2. Unset `MNPBEM_GPU` (or set to `0`) — the package will run CPU-only.
+2. Unset `MNPBEM_GPU` (or set to `0`) - the package will run CPU-only.
 
 ### "libcudart.so.12: cannot open shared object file"
 
@@ -238,7 +238,7 @@ pip install "mnpbem[gpu,mpi,fmm]"
 PyMNPBEM ships a single wheel rather than separate `mnpbem-cpu` and
 `mnpbem-gpu` distributions. Rationale:
 
-- All Python modules import cleanly without cupy — there is nothing to
+- All Python modules import cleanly without cupy - there is nothing to
   strip out for a CPU-only build.
 - Extras are a PyPI / pip standard and require no special tooling.
 - A separate `mnpbem-gpu` package would force the user to choose
