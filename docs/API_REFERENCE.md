@@ -1,7 +1,7 @@
 # API Reference
 
 This document lists every public symbol exported from `mnpbem`. The
-package mirrors the MATLAB MNPBEM17 class layout — if a name exists in
+package mirrors the MATLAB MNPBEM17 class layout - if a name exists in
 both, the calling sequence is kept compatible (see
 [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md) for line-by-line mapping).
 
@@ -95,12 +95,12 @@ Fermi-velocity table for `Au`/`Ag`/`Al`.
 
 **Factory methods**:
 
-- `EpsNonlocal.gold(eps_embed=None, delta_d=0.05, beta=None)` — Au
+- `EpsNonlocal.gold(eps_embed=None, delta_d=0.05, beta=None)` - Au
   (default β ≈ 0.714 eV·nm).
-- `EpsNonlocal.silver(eps_embed=None, delta_d=0.05, beta=None)` — Ag.
-- `EpsNonlocal.aluminum(eps_embed=None, delta_d=0.05, beta=None)` — Al.
+- `EpsNonlocal.silver(eps_embed=None, delta_d=0.05, beta=None)` - Ag.
+- `EpsNonlocal.aluminum(eps_embed=None, delta_d=0.05, beta=None)` - Al.
 - `EpsNonlocal.from_table(eps_table, eps_embed, eps_inf, omega_p, gamma, beta, delta_d=0.05, name=None)`
-  — custom Drude + tabulated metal (e.g. Johnson-Christy gold).
+  - custom Drude + tabulated metal (e.g. Johnson-Christy gold).
 
 **Helper**:
 
@@ -165,7 +165,7 @@ Drude".
 | `tricube(n, length=1.0, e=0.25)` | `n : int` per edge, `e` edge rounding | Rounded cube. |
 | `tritorus(diameter, rad, n=None)` | `rad`: tube radius | Triangulated torus. |
 | `trispheresegment(phi, theta, diameter=1.0, triangles=False)` | `phi, theta : array` | Sphere segment. |
-| `trispherescale(p, scale, unit=False)` | `scale`: radial factor per vertex (or per face) | Deforms a sphere, e.g. into an ellipsoid. **Modifies `p` in place** and returns the same object — pass a copy if you need the original. |
+| `trispherescale(p, scale, unit=False)` | `scale`: radial factor per vertex (or per face) | Deforms a sphere, e.g. into an ellipsoid. **Modifies `p` in place** and returns the same object - pass a copy if you need the original. |
 | `tripolygon(poly, edge, **opts)` | `poly : Polygon`, `edge : EdgeProfile` | 3D extrusion from 2D polygon. |
 | `fvgrid(x, y, triangles=False)` | | Convert parametric `(x, y)` surface to face/vertex. |
 | `connect(p1, p2=None, ind=None)` | | Connect two meshes / find connectivity tables. |
@@ -200,7 +200,7 @@ Drude".
 
 `from mnpbem.greenfun import ...`
 
-Most users do not construct Green objects directly — `BEMStat`, `BEMRet`,
+Most users do not construct Green objects directly - `BEMStat`, `BEMRet`,
 ... build them internally. They are exposed so you can plug in your own
 solver, or call `MeshField` to evaluate fields off-mesh.
 
@@ -228,7 +228,7 @@ solver, or call `MeshField` to evaluate fields off-mesh.
 
 ### Function
 
-- `greenfunction(p1, p2, op=None, **kwargs)` — convenience factory that
+- `greenfunction(p1, p2, op=None, **kwargs)` - convenience factory that
   picks `GreenStat`, `GreenRet`, or `GreenRetLayer` depending on `op`.
 
 ---
@@ -257,37 +257,37 @@ sig, bem = bem.solve(exc.potential(p, enei))   # solve at one wavelength
 | `BEMLayerMirror(...)` | | Layer + mirror symmetry. |
 | `BEMIter(...)` | abstract | Base for iterative solvers. |
 | `BEMStatIter(p, enei=None, **opts)` | | Quasistatic iterative (ACA+GMRES). |
-| `BEMRetIter(p, enei=None, **opts)` | | Retarded iterative (ACA+GMRES) — recommended for >5 k faces. |
+| `BEMRetIter(p, enei=None, **opts)` | | Retarded iterative (ACA+GMRES) - recommended for >5 k faces. |
 | `BEMRetLayerIter(p, layer, ...)` | | Retarded iterative on a substrate. |
 
 ### Common methods
 
-- `.init(enei) -> self` — refresh internal matrices for a new wavelength
+- `.init(enei) -> self` - refresh internal matrices for a new wavelength
   (called automatically by `.solve`).
-- `.solve(exc) -> (sig, bem)` — solve `bem * sig = exc` for surface
+- `.solve(exc) -> (sig, bem)` - solve `bem * sig = exc` for surface
   charges/currents `sig`. Returns the solver itself for chaining.
-- `.field(sig, point) -> field_struct` — evaluate `(E, H, phi, ...)` at
+- `.field(sig, point) -> field_struct` - evaluate `(E, H, phi, ...)` at
   `point : Point` or `ComPoint`.
-- `.potential(sig, point)` — evaluate scalar/vector potential at `point`.
-- `.clear()` — drop cached factors / matrices to free memory.
-- `.name`, `.needs` — metadata (excitation/observable kinds the solver
+- `.potential(sig, point)` - evaluate scalar/vector potential at `point`.
+- `.clear()` - drop cached factors / matrices to free memory.
+- `.name`, `.needs` - metadata (excitation/observable kinds the solver
   supports).
 
 ### Iterative-solver options
 
 `BEMStatIter` / `BEMRetIter` accept (kwargs or `op` dict):
 
-- `aca={"htol": 1e-6, "kmax": 100, "cleaf": 32, "eta": 2.5}` — ACA tolerance.
-- `iter={"tol": 1e-6, "restart": 30, "maxit": 200}` — GMRES parameters.
-- `precond="diag"` — Jacobi preconditioner (default, legacy).
-- `preconditioner='auto'`, `htol_precond=1e-4` — H-matrix LU
+- `aca={"htol": 1e-6, "kmax": 100, "cleaf": 32, "eta": 2.5}` - ACA tolerance.
+- `iter={"tol": 1e-6, "restart": 30, "maxit": 200}` - GMRES parameters.
+- `precond="diag"` - Jacobi preconditioner (default, legacy).
+- `preconditioner='auto'`, `htol_precond=1e-4` - H-matrix LU
   preconditioner (recommended when `hmatrix=True`). See the
   §"Preconditioner" section below for details.
-- `schur=True`, `schur_g_ss_solver='auto'` — Schur × Iterative
+- `schur=True`, `schur_g_ss_solver='auto'` - Schur × Iterative
   (automatic cover-layer elimination). See the §"Schur ×
   Iterative" section below for details.
 
-### Iterative BEM solvers — H-matrix mode
+### Iterative BEM solvers - H-matrix mode
 
 When a dense LU runs out of memory on a large mesh (25k+ faces), the
 problem can be solved with ACA H-matrix compression + GMRES. The
@@ -307,8 +307,8 @@ BEMRetIter(p, tol=1e-6, maxiter=200,
 
 When `hmatrix=True` is active:
 
-- ACA H-tree compression — exposed parameters (`htol`, `kmax`, `cleaf`).
-- GMRES with H-matrix matvec — `O(N log N)` per iteration.
+- ACA H-tree compression - exposed parameters (`htol`, `kmax`, `cleaf`).
+- GMRES with H-matrix matvec - `O(N log N)` per iteration.
 - Fits 25k+ faces on a single GPU. Combined with VRAM share,
   even 56k+ faces are within reach.
 
@@ -328,7 +328,7 @@ Unsupported combinations:
 - `BEMRetLayerIter + hmatrix` → `NotImplementedError`. The cover layer +
   planar substrate combination scenario does not currently exist.
 - `BEM*Iter` + the *dense* Schur reduction. Use the operator-form
-  `BEMRetIter(p, hmatrix=True, schur=True)` instead — see the §"Schur ×
+  `BEMRetIter(p, hmatrix=True, schur=True)` instead - see the §"Schur ×
   Iterative" section below.
 
 ### Preconditioner
@@ -347,11 +347,11 @@ BEMRetIter(p, hmatrix=True,
 
 `preconditioner` modes:
 
-- `auto` (default) — automatically ON when `hmatrix=True`, otherwise OFF.
-- `none` — no preconditioner.
-- `hlu_dense` — alpha-1, full N×N dense LU on `H.full()`. A baseline for
+- `auto` (default) - automatically ON when `hmatrix=True`, otherwise OFF.
+- `none` - no preconditioner.
+- `hlu_dense` - alpha-1, full N×N dense LU on `H.full()`. A baseline for
   small meshes.
-- `hlu_tree` — alpha-2, hierarchical block-Schur LU on the H-tree root
+- `hlu_tree` - alpha-2, hierarchical block-Schur LU on the H-tree root
   partition. For large meshes. In the 8N×8N coupled system of
   `BEMRetIter`, its standalone effect is limited, so it sometimes falls
   back to dense.
@@ -393,13 +393,13 @@ BEMRetIter(p, hmatrix=True, schur=True,
 
 `schur_g_ss_solver`:
 
-- `lu_dense` — recommended for shell DOF < 500 (one dense LU, then reuse).
-- `gmres` — large shell, inner GMRES (slower but lower memory).
-- `callable` — user-supplied `A_ss^{-1}` apply function.
-- `auto` — automatic shell DOF selection (`< 500` → `lu_dense`, otherwise `gmres`).
+- `lu_dense` - recommended for shell DOF < 500 (one dense LU, then reuse).
+- `gmres` - large shell, inner GMRES (slower but lower memory).
+- `callable` - user-supplied `A_ss^{-1}` apply function.
+- `auto` - automatic shell DOF selection (`< 500` → `lu_dense`, otherwise `gmres`).
 
 **Operator form**:
-`A_eff(x_c) = A_cc x_c − A_cs · A_ss⁻¹ · A_sc x_c` LinearOperator —
+`A_eff(x_c) = A_cc x_c − A_cs · A_ss⁻¹ · A_sc x_c` LinearOperator -
 GMRES only needs to see the reduced (core) dimension.
 
 568-face nano-gap nonlocal benchmark:
@@ -422,7 +422,7 @@ sig, bem = bem.solve(exc.potential(p, enei))
 `BEMStatIter` likewise supports simultaneous activation of `schur=True` +
 `hmatrix=True`.
 
-### Schur complement — direct solvers
+### Schur complement - direct solvers
 
 `BEMStat` / `BEMRet` support automatic elimination of cover-layer
 variables via the `schur=True` option. This reduces the memory of
@@ -452,7 +452,7 @@ p = ComParticle(
 )
 refun = coverlayer.refine(p, [[1, 2]])
 
-# apply Schur — eliminate cover-layer variables and solve the reduced matrix
+# apply Schur - eliminate cover-layer variables and solve the reduced matrix
 bem = BEMStat(p, refun=refun, schur=True)
 # equivalently:
 # bem = BEMRet(p, refun=refun, schur=True)
@@ -460,9 +460,9 @@ bem = BEMStat(p, refun=refun, schur=True)
 
 Option values:
 
-- `schur=True` — force Schur elimination when a cover layer is detected.
-- `schur=False` (default) — standard formulation.
-- `schur='auto'` — apply Schur when a cover layer is auto-detected, otherwise standard.
+- `schur=True` - force Schur elimination when a cover layer is detected.
+- `schur=False` (default) - standard formulation.
+- `schur='auto'` - apply Schur when a cover layer is auto-detected, otherwise standard.
 
 ### `plasmonmode(bem, n=10, ...)`
 
@@ -529,7 +529,7 @@ Methods: `.loss(sig)` returns the EELS probability spectrum.
 
 ### Field probes
 
-- `MeshField(p, x, y, z=None, nmax=None, mindist=None, sim='stat', **opts)` —
+- `MeshField(p, x, y, z=None, nmax=None, mindist=None, sim='stat', **opts)` -
   evaluate fields on a grid `(x, y, z)` outside the particle.
 
 ### Convenience factories (MATLAB-style dispatch)
@@ -620,30 +620,30 @@ Analytical reference solutions for spheres.
 
 ### Options
 
-- `bemoptions(op=None, **kwargs)` — build a default `op` dict.
-- `getbemoptions(*args, **kwargs)` — extract options for a given solver.
-- `getfields(struct, *names)` — pull fields from a `CompStruct`.
+- `bemoptions(op=None, **kwargs)` - build a default `op` dict.
+- `getbemoptions(*args, **kwargs)` - extract options for a given solver.
+- `getfields(struct, *names)` - pull fields from a `CompStruct`.
 
 ### Quadrature & shapes
 
-- `Tri`, `Quad`, `triangle_unit_set`, `trisubdivide` — triangle and
+- `Tri`, `Quad`, `triangle_unit_set`, `trisubdivide` - triangle and
   unit-element helpers.
-- `lglnodes`, `lgwt` — Gauss-Legendre nodes / weights.
-- `IGrid2`, `IGrid3` — integer-indexed regular grids.
-- `ValArray`, `VecArray` — typed array containers.
-- `QuadFace` — quadrilateral face element.
+- `lglnodes`, `lgwt` - Gauss-Legendre nodes / weights.
+- `IGrid2`, `IGrid3` - integer-indexed regular grids.
+- `ValArray`, `VecArray` - typed array containers.
+- `QuadFace` - quadrilateral face element.
 
 ### Plotting
 
-- `BemPlot(**kwargs)` — particle / field viewer (matplotlib).
-- `arrowplot`, `coneplot`, `coneplot2` — vector field plots.
-- `mycolormap` — divergent colormap matching MATLAB's default.
-- `particlecursor` — interactive face inspector.
+- `BemPlot(**kwargs)` - particle / field viewer (matplotlib).
+- `arrowplot`, `coneplot`, `coneplot2` - vector field plots.
+- `mycolormap` - divergent colormap matching MATLAB's default.
+- `particlecursor` - interactive face inspector.
 
 ### Other
 
 - `nettable`, `patchcurvature`, `memsize`, `round_left`, `Mem`,
-  `multi_waitbar` — miscellaneous helpers ported from MATLAB.
+  `multi_waitbar` - miscellaneous helpers ported from MATLAB.
 
 ---
 
@@ -653,13 +653,13 @@ Analytical reference solutions for spheres.
 
 | Function | Description |
 |---|---|
-| `compute_spectrum(bem, exc, particle, wavelengths, **kwargs)` | Serial spectrum sweep. Returns a `dict` with the keys the excitation supports — `'extinction'`, `'scattering'`, `'absorption'` — each an array of one entry per wavelength (or `(n_wl, npol)` for several polarizations). |
+| `compute_spectrum(bem, exc, particle, wavelengths, **kwargs)` | Serial spectrum sweep. Returns a `dict` with the keys the excitation supports - `'extinction'`, `'scattering'`, `'absorption'` - each an array of one entry per wavelength (or `(n_wl, npol)` for several polarizations). |
 | `compute_spectrum_parallel(bem, exc, particle, wavelengths, n_jobs=-1, backend='loky', **kwargs)` | Same result, computed over a joblib process pool. Requires `joblib`; without it a warning is emitted and the sweep falls back to `compute_spectrum`. |
 
 For multi-GPU and multi-node MPI sweeps see
 [examples/07_gpu_multigpu.py](../examples/07_gpu_multigpu.py).
 
-### VRAM share — multi-GPU LU
+### VRAM share - multi-GPU LU
 
 Handles the dense LU solve of a large mesh (25k+ faces) with a
 multi-GPU memory pool. When exceeding the single-GPU VRAM limit (e.g.
@@ -688,11 +688,11 @@ x  = lu_solve_dispatch(lu, b, n_gpus=4)
 
 Supported backends (`MNPBEM_VRAM_SHARE_BACKEND`):
 
-- `cusolvermg` — NVIDIA cuSOLVER MG (recommended). Automatic NVLink/PCIe optimization.
-- `magma` — ICL Magma multi-GPU (planned).
-- `nccl` — user-defined block-distributed LU (planned).
+- `cusolvermg` - NVIDIA cuSOLVER MG (recommended). Automatic NVLink/PCIe optimization.
+- `magma` - ICL Magma multi-GPU (planned).
+- `nccl` - user-defined block-distributed LU (planned).
 
-VRAM share can be combined with multi-worker wavelength distribution — e.g.
+VRAM share can be combined with multi-worker wavelength distribution - e.g.
 four 2-GPU pools in an 8-GPU environment.
 
 For details see `docs/ARCHITECTURE.md` §3.12.
