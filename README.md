@@ -24,7 +24,7 @@ mechanically (see `docs/MIGRATION_GUIDE.md`). What the Python port adds:
 - **Python-native API** with `numpy` arrays instead of MATLAB structs.
 - **GPU acceleration** via `cupy` (single GPU and multi-GPU wavelength dispatch).
 - **Iterative solver** (`BEMRetIter`, `BEMStatIter`) using ACA-compressed
-  H-matrices and GMRES — scales to tens of thousands of boundary elements.
+  H-matrices and GMRES - scales to tens of thousands of boundary elements.
 - **Multi-node MPI** wavelength dispatch for spectrum sweeps.
 - **Numerical agreement with MATLAB MNPBEM17**, verified demo by demo over
   the full set of 72 MNPBEM demos.
@@ -42,7 +42,7 @@ pip install "mnpbem[gpu,mpi]"    # + multi-node MPI (mpi4py)
 pip install "mnpbem[all]"        # everything (gpu + mpi + fmm)
 ```
 
-CPU-only is the default — GPU / MPI / FMM dependencies are pulled only
+CPU-only is the default - GPU / MPI / FMM dependencies are pulled only
 when the matching extra is requested. The runtime auto-detects what is
 available and falls back to NumPy when GPU dependencies are missing.
 
@@ -85,12 +85,12 @@ A complete worked spectrum + plot is in [`examples/01_sphere_extinction.py`](exa
 
 ## Documentation
 
-- [API Reference](docs/API_REFERENCE.md) — every public class and function.
-- [Migration Guide (from MATLAB)](docs/MIGRATION_GUIDE.md) — line-by-line mapping.
-- [Examples](examples/) — runnable Python scripts and a Jupyter tutorial.
-- [Architecture](docs/ARCHITECTURE.md) — package layout and design notes.
-- [Installation](docs/INSTALL.md) — prerequisites, GPU / MPI setup, troubleshooting.
-- [H-matrix on GPU](docs/H_MATRIX_GPU.md) — ACA compression and the GPU H-matrix path.
+- [API Reference](docs/API_REFERENCE.md) - every public class and function.
+- [Migration Guide (from MATLAB)](docs/MIGRATION_GUIDE.md) - line-by-line mapping.
+- [Examples](examples/) - runnable Python scripts and a Jupyter tutorial.
+- [Architecture](docs/ARCHITECTURE.md) - package layout and design notes.
+- [Installation](docs/INSTALL.md) - prerequisites, GPU / MPI setup, troubleshooting.
+- [H-matrix on GPU](docs/H_MATRIX_GPU.md) - ACA compression and the GPU H-matrix path.
 
 ## Repository Layout
 
