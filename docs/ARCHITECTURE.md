@@ -1,4 +1,4 @@
-# PyMNPBEM — Architecture
+# PyMNPBEM - Architecture
 
 This document is aimed at contributors and maintainers (including future-self).
 It describes how the Python port is laid out, *why* the major design choices
@@ -14,14 +14,14 @@ The Python port is a faithful, MATLAB-compatible re-implementation of
 Hohenester & Trügler's MNPBEM toolbox. The goals, in priority order, are:
 
 1. **Numerical parity with MATLAB** on the official demo set (50 + 22 demos)
-   — bit-identical where the underlying math libraries permit, and within
+   - bit-identical where the underlying math libraries permit, and within
    floating-point ULP tolerance otherwise.
-2. **Pure Python distribution** — no MATLAB runtime required at import or
+2. **Pure Python distribution** - no MATLAB runtime required at import or
    call time. MATLAB Engine is only used as an *optional* validation backend
    (opt-in via env var) for cross-checking specific demos.
-3. **Performance parity or better** — CPU-only path keeps up with MATLAB on
+3. **Performance parity or better** - CPU-only path keeps up with MATLAB on
    small/medium meshes; CuPy GPU path scales beyond what MATLAB can do.
-4. **A drop-in API** — class names, method names, and option keywords
+4. **A drop-in API** - class names, method names, and option keywords
    mirror the MATLAB OOP layout so MATLAB users can port scripts mechanically.
 
 The core stack is:
@@ -59,12 +59,12 @@ MNPBEM/
 | `particle.py`            | `Particle` base class (`verts`, `faces`, `nvec`, `area`, ...) |
 | `comparticle.py`         | Multi-particle composite; tracks `inout`, `closed`, `eps`     |
 | `comparticle_mirror.py`  | Mirror-symmetric variant; whitelisted `sym ∈ {x,y,z,xy,...}`  |
-| `compoint.py`            | `Point` / `ComPoint` — observation-point bag with `inout`     |
-| `polygon.py`             | 2D polygon — boolean ops, normalization, plotting             |
+| `compoint.py`            | `Point` / `ComPoint` - observation-point bag with `inout`     |
+| `polygon.py`             | 2D polygon - boolean ops, normalization, plotting             |
 | `polygon3.py`            | Lift a 2D polygon into 3D; `plate`, `vribbon`, etc.           |
 | `edgeprofile.py`         | Edge profile generator for rounded prism edges                |
 | `mesh_generators.py`     | `trisphere`, `trirod`, `tricube`, `tritorus`, `trispheresegment`, `tripolygon`, `fvgrid` |
-| `mesh2d.py`              | 2D Delaunay mesher — line-by-line port of MATLAB `mesh2d`     |
+| `mesh2d.py`              | 2D Delaunay mesher - line-by-line port of MATLAB `mesh2d`     |
 | `shape_functions.py`     | Linear/curv face shape functions and quadrature mappings      |
 | `connect.py`             | Particle-particle connectivity & edge stitching               |
 | `compound.py`            | `@compound` MATLAB OOP class (10 public methods)              |
@@ -88,7 +88,7 @@ and stratified layer systems.
 | `compgreen_stat_layer.py` / `compgreen_ret_layer.py`   | Layered-medium extensions  |
 | `greenstat.py` / `greenret_layer.py` / `greenret_refined.py` | Lower-level kernel + diagonal/off-diagonal refinement |
 | `greentab_layer.py` / `compgreentab_layer.py` | Tabulated layered Green functions; bilinear/trilinear interp |
-| `coverlayer.py`               | `+coverlayer` — refinement on layer-interface particles |
+| `coverlayer.py`               | `+coverlayer` - refinement on layer-interface particles |
 | `clustertree.py` / `hmatrix.py` | Cluster tree + hierarchical low-rank matrix      |
 | `aca_compgreen_stat.py` / `aca_compgreen_ret.py` / `aca_compgreen_ret_layer.py` | ACA-accelerated Green functions |
 | `aca_gpu.py` / `h_matrix_gpu.py` | GPU prototypes of ACA and H-matrix              |
@@ -131,7 +131,7 @@ the `spectrum(...)` factory. The retarded variants embed the MATLAB
 
 ### 2.7 `mnpbem.mie`
 
-Reference Mie solver (`MieStat`, `MieRet`, `MieGans`) — cross-checks
+Reference Mie solver (`MieStat`, `MieRet`, `MieGans`) - cross-checks
 spherical-particle results without going through BEM.
 
 ### 2.8 `mnpbem.misc`
@@ -157,7 +157,7 @@ nodes (`lglnodes`, `lgwt`), `QuadFace` polar quadrature, options
 
 ## 3. Key design decisions
 
-### 3.1 `matlab_compat` — why it exists
+### 3.1 `matlab_compat` - why it exists
 
 `np.linspace`, `np.arctan2`, `np.exp`, `np.log`, `np.sqrt` and friends each
 differ from MATLAB by up to 1 ULP because of different accumulation order or
@@ -189,7 +189,7 @@ See: `mnpbem/utils/matlab_compat.py`.
 
 ### 3.3 GPU dispatch (opt-in)
 
-- Activation: env var `MNPBEM_GPU=1` (default OFF — explicit opt-in to avoid
+- Activation: env var `MNPBEM_GPU=1` (default OFF - explicit opt-in to avoid
   surprising users without CUDA).
 - Threshold: `MNPBEM_GPU_THRESHOLD` (default 1500). Below the threshold,
   scipy CPU LU is faster than the host↔device round trip.
@@ -209,10 +209,10 @@ Wavelength sweeps are embarrassingly parallel for the BEMRet solve: each
 λ builds and solves an independent system. This is the only axis the port
 parallelises across processes:
 
-- `mnpbem.utils.multi_gpu.solve_spectrum_multi_gpu` — splits λ across local
+- `mnpbem.utils.multi_gpu.solve_spectrum_multi_gpu` - splits λ across local
   GPUs, one subprocess per CUDA device, `CUDA_VISIBLE_DEVICES` pinning,
   results merged through a `multiprocessing.Queue`.
-- `mnpbem.utils.mpi_dispatch.solve_spectrum_mpi` — adds an MPI rank axis on
+- `mnpbem.utils.mpi_dispatch.solve_spectrum_mpi` - adds an MPI rank axis on
   top: each rank gets a wavelength slice, then internally calls
   `solve_spectrum_multi_gpu`. Falls back to a serial CPU loop if the rank
   has no GPU and to `solve_spectrum_multi_gpu` if `mpi4py` is missing or
@@ -260,7 +260,7 @@ complex k-plane. Two backends:
   RHS, plus a custom `matlab_ode45.py` step controller for cases where
   exact MATLAB step pattern is required.
 
-### 3.8 Direct retarded solver — block matrix form
+### 3.8 Direct retarded solver - block matrix form
 
 `BEMRet` rebuilds the MATLAB `initmat.m` 2x2 structured block system rather
 than the older single-monolith form. This was required to match MATLAB on
@@ -287,7 +287,7 @@ correct than MATLAB; we matched MATLAB anyway, because parity is the
 acceptance criterion. Examples:
 
 - `_minrectangle` tie-break uses MATLAB's strict `<` comparison instead of
-  Python's `<=`, even though either is mathematically valid — so that
+  Python's `<=`, even though either is mathematically valid - so that
   regular-N-gon meshes orient identically.
 - `dipoleretlayer` keeps MATLAB's `pinfty` bug for compatibility on
   `demodipret*`.
@@ -295,7 +295,7 @@ acceptance criterion. Examples:
   the layer Sommerfeld values agree to ULP.
 
 If you find a MATLAB behaviour that looks wrong, please flag it before
-"fixing" it — numerical parity with MATLAB will likely regress.
+"fixing" it - numerical parity with MATLAB will likely regress.
 
 ### 3.11 Schur complement for cover-layer BEM
 
@@ -321,7 +321,7 @@ S * x_c = b_c - A_cs * A_ss^-1 * b_s
 x_s = A_ss^-1 * (b_s - A_sc * x_c)
 ```
 
-to be solved. This is mathematically equivalent to the standard formulation —
+to be solved. This is mathematically equivalent to the standard formulation -
 it matches the unreduced solve to machine precision (rel < 1e-12).
 
 - Activation: `BEMStat(p, schur=True)`, `BEMRet(p, schur=True)`, or
@@ -331,11 +331,11 @@ it matches the unreduced solve to machine precision (rel < 1e-12).
 - The iterative solvers use the operator-form variant of the same
   elimination instead of this dense reduction; see §3.15 and §3.16.
 
-### 3.12 VRAM share — multi-GPU LU dispatch
+### 3.12 VRAM share - multi-GPU LU dispatch
 
 A path that handles a large dense LU (25k+ face, 50+ GB) that exceeds the VRAM
 of a single GPU (e.g. RTX A6000 48 GB) using a multi-GPU memory pool. This is
-an axis orthogonal to the wavelength-distribution multi-GPU mode of §3.4 —
+an axis orthogonal to the wavelength-distribution multi-GPU mode of §3.4 -
 one worker combines the memory of N GPUs to handle *one* large computation.
 
 | Mode | # workers | VRAM per worker | Use case |
@@ -345,7 +345,7 @@ one worker combines the memory of N GPUs to handle *one* large computation.
 | Both modes combined | N | sum of M GPUs | large computation × wavelength distribution |
 
 The default backend is NVIDIA cuSOLVER MG (`cusolverMgGetrf` /
-`cusolverMgGetrs`) — with a block-cyclic distributed matrix, NVLink/PCIe
+`cusolverMgGetrs`) - with a block-cyclic distributed matrix, NVLink/PCIe
 transfers are automatically optimized on the NVIDIA side. It runs on top of
 the cupy MemoryPool.
 
@@ -378,7 +378,7 @@ Implementation highlights:
 - Integrates the H-matrix Green function module of §3.5 with `BEMRetIter` /
   `BEMStatIter`. ACA is extended from block-level compression to the *whole
   H-tree* level.
-- The GMRES matvec op calls the H-matrix matvec — `O(N log N)` per iter.
+- The GMRES matvec op calls the H-matrix matvec - `O(N log N)` per iter.
 - `hmatrix=True` opt-in (the default path is the dense / block-ACA solver).
 - Can be combined with VRAM share: the H-matrix itself fits in single-GPU
   memory, and only the dense part (preconditioner, etc.) is handled by the
@@ -391,7 +391,7 @@ Activation:
   block-level ACA of §3.5).
 Limitations:
 
-- `BEMRetLayerIter + hmatrix` unsupported (`NotImplementedError`) — there is no
+- `BEMRetLayerIter + hmatrix` unsupported (`NotImplementedError`) - there is no
   combined cover layer + planar substrate scenario.
 - Combining `BEM*Iter` with the *dense* Schur reduction of §3.11 is
   unsupported; use the operator-form Schur of §3.15 instead.
@@ -404,14 +404,14 @@ Key decision: **single wheel + extras** (NOT separate wheels).
 
 Reasons:
 
-- Standard PyPI pattern — most ML/numerical packages separate GPU
+- Standard PyPI pattern - most ML/numerical packages separate GPU
   dependencies as extras like `[gpu]` (e.g. `tensorflow`,
   `jax[cuda12]`, `pytorch-lightning[extra]`).
-- The code itself uses a cupy lazy import — `mnpbem/utils/gpu.py` catches the
+- The code itself uses a cupy lazy import - `mnpbem/utils/gpu.py` catches the
   cupy `ImportError` and falls back to the CPU path. Thus a single code base
   can run on both CPU and GPU without producing separate wheels.
 - Relative to the user value, separate wheels (e.g. `mnpbem-cpu`,
-  `mnpbem-gpu`) carry a high build + maintenance cost — two build matrices must
+  `mnpbem-gpu`) carry a high build + maintenance cost - two build matrices must
   be run separately in CI, and users must also choose between differently named
   packages.
 
@@ -420,7 +420,7 @@ auto-detect**:
 
 | Extra | Extra dependencies | Purpose |
 |---|---|---|
-| `mnpbem` (default) | (none) | CPU only — numpy/scipy/numba only |
+| `mnpbem` (default) | (none) | CPU only - numpy/scipy/numba only |
 | `mnpbem[gpu]` | cupy-cuda12x | NVIDIA GPU acceleration |
 | `mnpbem[mpi]` | mpi4py | multi-node wavelength distribution |
 | `mnpbem[fmm]` | fmm3dpy | free-space ret meshfield acceleration |
@@ -429,15 +429,15 @@ auto-detect**:
 
 Runtime auto-detect (`mnpbem/utils/gpu.py`):
 
-- `has_gpu_capability(verbose=True)` — checks cupy import + CUDA driver +
+- `has_gpu_capability(verbose=True)` - checks cupy import + CUDA driver +
   GPU device. A friendly message for each missing item.
-- `get_install_hint()` — a string guiding the `pip install mnpbem[gpu]` command
+- `get_install_hint()` - a string guiding the `pip install mnpbem[gpu]` command
   needed to enable GPU in the current environment.
 - If the `MNPBEM_GPU=1` env var is specified but cupy is not installed, a
   `RuntimeError` + install-command guidance is raised at BEM solver call time
   (clearer than a silent fallback).
 
-User guide: `docs/INSTALL.md` — gathers the per-scenario (CPU only / single
+User guide: `docs/INSTALL.md` - gathers the per-scenario (CPU only / single
 GPU / multi-GPU / multi-node / development) install procedures in one place.
 
 ### 3.15 H-matrix LU preconditioner + Schur × Iter
@@ -459,7 +459,7 @@ section covers both.
   preconditioner='auto', htol_precond=1e-4)`. Same for `BEMStatIter`.
 - 256-face sphere benchmark: GMRES iter 55 → 1 (55× reduction),
   wall 1.03 s → 0.82 s.
-- Limitation — in `BEMRetIter`'s 8N×8N coupled system, the G-only H-tree LU
+- Limitation - in `BEMRetIter`'s 8N×8N coupled system, the G-only H-tree LU
   has limited effect on its own, so `hlu_tree` sometimes falls back to dense.
   A truly memory-friendly preconditioner for 25k face would require
   reconstructing Sigma/Delta themselves as an H-matrix, which is future
@@ -470,7 +470,7 @@ section covers both.
 
 - Implementation: `mnpbem/bem/schur_iter_helpers.py` (`SchurIterOperator`,
   a `LinearOperator` subclass).
-- Operation: `A_eff(x_c) = A_cc x_c − A_cs · A_ss⁻¹ · A_sc x_c` —
+- Operation: `A_eff(x_c) = A_cc x_c − A_cs · A_ss⁻¹ · A_sc x_c` -
   GMRES only needs to see the reduced (core) dimension. `A_ss⁻¹` is chosen
   from `lu_dense` (dense LU once + reuse) / `gmres` (inner Krylov) /
   `callable` (user-supplied) / `auto` (dispatch based on shell DOF).
@@ -480,7 +480,7 @@ section covers both.
 - 568-face nano-gap nonlocal benchmark: solve 21.17 s → 16.65 s
   (21.3% savings). The effect of the reduced GMRES Krylov dimension +
   `A_ss⁻¹` reuse.
-- Compared with the dense Schur of §3.11 — dense directly inverts `G_ss`, so it is
+- Compared with the dense Schur of §3.11 - dense directly inverts `G_ss`, so it is
   incompatible with the H-matrix. `SchurIterOperator` uses only the *full
   matvec A·v*, so it meshes naturally with the H-matrix.
 
@@ -493,7 +493,7 @@ To avoid the inner-GMRES burden when `SchurIterOperator` uses
 from 500 → 4096. The dense LU probe is efficient up to N=4096 (≈128 MB at
 complex128).
 
-Math: the Schur reduction itself is exact regardless of `A_full`. Insight — no
+Math: the Schur reduction itself is exact regardless of `A_full`. Insight - no
 operator-form Schur reimplementation needed. The inner GMRES cost is the real
 bottleneck.
 
@@ -519,12 +519,12 @@ MATLAB MNPBEM17: **2.21×** on CPU and **3.60×** on a single GPU.
 The port was developed against MATLAB MNPBEM17 as the reference
 implementation, along three axes:
 
-- Unit level — Mie, EELS, layer, mirror, iterative and edge-case checks on
+- Unit level - Mie, EELS, layer, mirror, iterative and edge-case checks on
   every module.
-- Numerical cross-checks — sphere and rod cross sections against MATLAB for
+- Numerical cross-checks - sphere and rod cross sections against MATLAB for
   each solver axis (Mie, BEMStat, BEMRet, BEMStatLayer, BEMRetLayer, mirror,
   eigenmode, iterative, dipole, dipole-layer, EELS, near-field, shapes).
-- Demo level — all 72 MATLAB demo scripts were run in both toolboxes and
+- Demo level - all 72 MATLAB demo scripts were run in both toolboxes and
   compared observable-by-observable.
 
 The resulting agreement, and the known limits of what is achievable
