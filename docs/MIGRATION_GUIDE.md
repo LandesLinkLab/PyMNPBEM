@@ -177,11 +177,11 @@ breaks the static problem). When in doubt, pass `closed=[1]` (or
 - **`closed` argument**: 1-based, like MATLAB.
 - **`faces`** array: stored 0-based internally, like every NumPy array.
   When you write `p.faces` you get 0-based indices into `p.verts`.
-  MATLAB's `p.faces` is 1-based — adjust by `-1` if you compare both.
+  MATLAB's `p.faces` is 1-based - adjust by `-1` if you compare both.
 
 ### 3. Polarization / direction shape
 
-MATLAB lets you write `planewave([1 0 0], [0 0 1])` — a 1×3 row vector.
+MATLAB lets you write `planewave([1 0 0], [0 0 1])` - a 1×3 row vector.
 NumPy keeps the same shape but typed:
 
 ```python
@@ -217,7 +217,7 @@ ComParticle(eps, [p], [[2, 1]], 1, interp="curv", AbsCutoff=1e-3, RelCutoff=2)
 ```
 
 If you previously tuned `op.RelCutoff` for accuracy, keep the same
-value in Python — the integration scheme is bit-identical for
+value in Python - the integration scheme is bit-identical for
 `interp='flat'` and ULP-close for `interp='curv'`.
 
 ### 6. Closed surfaces & EELS
@@ -313,7 +313,7 @@ spec = SpectrumRet()                # uses default 256-face unit sphere
 
 MATLAB: `sig = bem \ exc` (single return).
 Python: `sig, bem = bem.solve(exc)` (two returns: the second is the
-solver itself, with cached factors). Always unpack both — if you do
+solver itself, with cached factors). Always unpack both - if you do
 `sig = bem.solve(exc)` you'll get a tuple by accident.
 
 ### 14. Wavelength sweep performance
@@ -321,7 +321,7 @@ solver itself, with cached factors). Always unpack both — if you do
 In MATLAB, `bem.init(enei)` is sometimes called explicitly. In Python,
 `bem.solve(exc.potential(p, enei))` does it implicitly. If you sweep
 many wavelengths for the same particle, the dense-matrix factor is
-re-built each call — use `BEMRetIter` (ACA + GMRES) which scales much
+re-built each call - use `BEMRetIter` (ACA + GMRES) which scales much
 better, or use `compute_spectrum_parallel` for embarrassingly-parallel
 wavelength sweeps.
 
@@ -367,7 +367,7 @@ caveats when porting MATLAB nonlocal scripts:
    - For large mesh (25k+ faces) + nonlocal scenarios, use a multi-GPU
      pool via the `MNPBEM_VRAM_SHARE_GPUS=N` environment variable
      (cuSolverMg backend).
-5. **`BEMRet` accepts `refun`** — use it when you want the retarded path
+5. **`BEMRet` accepts `refun`** - use it when you want the retarded path
    with the cover-layer integration, exactly as `BEMStat` does.
 
 ### 17. Schur complement
@@ -407,7 +407,7 @@ bem = BEMRet(p)   # automatically uses multi-GPU LU
 ```
 
 Mesh sizes that cause single-GPU OOM can be fit into a multi-GPU pool.
-Can be combined with multi-worker wavelength distribution — e.g. four
+Can be combined with multi-worker wavelength distribution - e.g. four
 2-GPU pools in an 8-GPU environment.
 
 ### 19. Large mesh strategy
@@ -418,7 +418,7 @@ A guide for deciding how to handle 25k+ face simulations.
 |---|---|
 | < 1k | dense BEMStat / BEMRet |
 | 1k - 5k | dense + Numba JIT (`MNPBEM_NUMBA=1`) |
-| 5k - 25k | `BEMRetIter(p, hmatrix=True)` — H-matrix iter |
+| 5k - 25k | `BEMRetIter(p, hmatrix=True)` - H-matrix iter |
 | 25k+ | `BEMRetIter(p, hmatrix=True)` + VRAM share (multi-GPU) |
 | 50k+ | + separate H-matrix distribution / preconditioner tuning (experimental) |
 
@@ -437,16 +437,16 @@ os.environ['MNPBEM_VRAM_SHARE_GPUS'] = '4'
 **Common issue**: if GMRES does not converge, try the following:
 
 - Relax `tol` (e.g. 1e-4) or increase `maxiter`.
-- Tighten `htol` (e.g. 1e-7) — effective when H-matrix compression is
+- Tighten `htol` (e.g. 1e-7) - effective when H-matrix compression is
   too loose and the conditioning degrades.
 - Strengthen the preconditioner with `preconditioner='auto'` (H-matrix
   LU). On the 256-face sphere, GMRES iterations go 55 → 1. See
   pitfall #21.
 
-H-matrix vs dense results are `htol`-based — at `htol=1e-6` they agree
+H-matrix vs dense results are `htol`-based - at `htol=1e-6` they agree
 at the relative `< 1e-4` level.
 
-### 20. Install scope — extras
+### 20. Install scope - extras
 
 The base install is CPU-only. Accelerators are selected with **extras**
 so the install matches your environment:
@@ -486,7 +486,7 @@ elimination of the cover-layer variables on large nonlocal meshes.
 | Small nonlocal (< 1k face cover) | `BEMStat(p, schur=True)` |
 | Medium nonlocal (1-5k) | `BEMRetIter(p, hmatrix=True, schur=True)` |
 | Large nonlocal (5k+) | + `preconditioner='auto'` |
-| 25k+ nonlocal (cover 50k+ faces) | + VRAM share — Sigma H-matrix reconstruction is future work |
+| 25k+ nonlocal (cover 50k+ faces) | + VRAM share - Sigma H-matrix reconstruction is future work |
 
 **Example**:
 
@@ -516,16 +516,16 @@ os.environ['MNPBEM_VRAM_SHARE_GPUS'] = '4'
 
 ## What does **not** map cleanly
 
-A small number of MATLAB features are not yet ported — usually because
+A small number of MATLAB features are not yet ported - usually because
 their Python equivalent is materially different. If you rely on these,
 file an issue.
 
 | MATLAB feature | Status |
 |---|---|
-| `nonlocal.m` (Pendry-style nonlocal cover layer) | done — see `EpsNonlocal` / `make_nonlocal_pair` and pitfall #16 |
+| `nonlocal.m` (Pendry-style nonlocal cover layer) | done - see `EpsNonlocal` / `make_nonlocal_pair` and pitfall #16 |
 | GUI (`MNPBEM_GUI`) | not ported (use `BemPlot` for static viewing) |
 | `makemnpbemhelp.m` (HTML help generator) | replaced by this `docs/` directory |
-| `compound.norm`, `compound.union` (set-algebra helpers) | partial — see `docs/API_REFERENCE.md`, `Compound` |
+| `compound.norm`, `compound.union` (set-algebra helpers) | partial - see `docs/API_REFERENCE.md`, `Compound` |
 
 For everything in the standard `Demo/` directory (72 demos, including
 EELS, layered substrate, dipole decay, plane wave, mirror symmetry),
