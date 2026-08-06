@@ -88,29 +88,7 @@ class MainController(QMainWindow):
         
 
 
-def _require_wrapper():
-    """Fail early, and legibly, when the wrapper repository is missing.
-
-    Every page imports pymnpbem_simulation. It is a separate repository rather
-    than a PyPI package, so extras cannot pull it in and the failure would
-    otherwise surface as a bare ModuleNotFoundError from somewhere deep in a
-    page import.
-    """
-    try:
-        import pymnpbem_simulation                      # noqa: F401
-    except ImportError:
-        raise SystemExit(
-            "PyMNPBEM GUI: the pymnpbem_simulation wrapper is not installed.\n"
-            "It is a separate repository, so pip install PyMNPBEM[gui] does not\n"
-            "bring it in:\n"
-            "    git clone https://github.com/LandesLinkLab/pymnpbem_simulation.git\n"
-            "    pip install -e pymnpbem_simulation\n"
-            "See docs/GUI_SETUP.md.")
-
-
 def main():
-    _require_wrapper()
-
     app = QApplication(sys.argv)
 
     base_dir = Path(__file__).resolve().parent
