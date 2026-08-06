@@ -40,8 +40,26 @@ conda activate mnpbem
 pip install mnpbem               # CPU only (default)
 pip install "mnpbem[gpu]"        # GPU acceleration with CuPy and CUDA 12
 pip install "mnpbem[gpu,mpi]"    # Multi-node MPI with mpi4py
-pip install "mnpbem[all]"        # All optional features: GPU, MPI, and FMM
+pip install "mnpbem[all]"        # All optional features: GPU, MPI, FMM, and GUI
 ```
+
+### Desktop GUI
+
+PyMNPBEM ships a PySide6 desktop front end (`mnpbem.gui`) covering environment
+setup, structure and excitation definition, and post-processing of the results.
+
+```bash
+pip install "mnpbem[gui]"
+pymnpbem-gui
+```
+
+The GUI additionally requires the
+[pymnpbem_simulation](https://github.com/LandesLinkLab/pymnpbem_simulation)
+wrapper, which is a separate repository and therefore **not** pulled in by the
+`gui` extra. Both have to be cloned and installed; the GUI exits with a message
+telling you so if the wrapper is missing. See
+[GUI setup](docs/GUI_SETUP.md) for the full procedure and
+[GUI guide](docs/GUI_GUIDE.md) for how to drive it.
 
 CPU-only installation is the default. GPU, MPI, and FMM dependencies are
 installed only when the corresponding extras are requested. At runtime,
@@ -98,12 +116,15 @@ A complete spectrum calculation and plotting example is available in
 - [Architecture](docs/ARCHITECTURE.md): Package layout and design notes.
 - [Installation](docs/INSTALL.md): Prerequisites, GPU and MPI setup, and troubleshooting.
 - [H-matrix on GPU](docs/H_MATRIX_GPU.md): ACA compression and the GPU H-matrix implementation.
+- [GUI setup](docs/GUI_SETUP.md): Installing and launching the desktop interface.
+- [GUI guide](docs/GUI_GUIDE.md): Walkthrough of the three GUI screens.
 
 ## Repository Layout
 
 ```text
 mnpbem/                  # Python package: geometry, BEM, Green functions, simulation, and related modules
-docs/                    # User documentation: API, migration, installation, and architecture
+mnpbem/gui/              # PySide6 desktop interface (optional, needs the [gui] extra)
+docs/                    # User documentation: API, migration, installation, architecture, and GUI
 examples/                # Runnable Python examples and a Jupyter tutorial
 ```
 
