@@ -196,11 +196,19 @@ class StartPage(QWidget):
         n_threads = int(self.n_threads_input.value())
         n_gpus_per_worker = int(self.n_gpus_input.value())
 
+        # assert_pre_import() is deliberately not called here. This module lives
+        # inside the mnpbem package, so mnpbem -- and with it NumPy and Numba --
+        # is always imported before any GUI code runs and the assertion could
+        # never pass. pymnpbem_gui.py raises the thread ceiling before those
+        # imports; apply_thread_limit() narrows it to the user's choice now.
+        # setup_env() still matters: MNPBEM_GPU / MNPBEM_NUMBA are read per call,
+        # and subprocesses spawned later inherit the exported values.
         try:
-            from pymnpbem_simulation.env_setup import assert_pre_import, setup_env
+            from pymnpbem_simulation.env_setup import setup_env
+            from ..thread_control import apply_thread_limit
 
-            assert_pre_import()
             setup_env(n_threads = n_threads, n_gpus_per_worker = n_gpus_per_worker)
+            applied, notes = apply_thread_limit(n_threads)
         except Exception as exc:
             QMessageBox.critical(
                 self,
@@ -209,6 +217,15 @@ class StartPage(QWidget):
                 QMessageBox.Ok
             )
             return
+
+        if not applied:
+            QMessageBox.warning(
+                self,
+                "Thread Setting Partially Applied",
+                "The simulation will run, but the thread count could not be applied "
+                "everywhere:\n\n- {}".format("\n- ".join(notes)),
+                QMessageBox.Ok
+            )
 
         self.state.env_n_workers = n_workers
         self.state.env_n_threads = n_threads
