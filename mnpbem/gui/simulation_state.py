@@ -773,6 +773,11 @@ class SimulationState:
         
         def _worker():
             try:
+                # Numba's thread count is thread-local, so the Start page's value
+                # has to be re-applied inside the thread the solver runs in.
+                from .thread_control import apply_thread_limit_in_worker
+                apply_thread_limit_in_worker(n_threads)
+
                 result = self.run_simulation(
                     output_dir=output_dir,
                     output_name=output_name,
