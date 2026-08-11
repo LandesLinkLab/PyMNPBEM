@@ -1,9 +1,14 @@
-"""PyMNPBEM GUI entry point.
+"""PyMNPBEM GUI window and page router.
 
-Run either way::
+Launch through the top-level launcher, never this module directly::
 
-    pymnpbem-gui                       # console script, installed with the package
-    python -m mnpbem.gui.gui_main      # from a source checkout
+    pymnpbem-gui                  # console script -> pymnpbem_gui:main
+    python pymnpbem_gui.py        # from a source checkout
+
+``python -m mnpbem.gui.gui_main`` still opens the window, but it skips the
+thread-count ceiling that pymnpbem_gui.py sets before NumPy and Numba are
+imported, so the Threads value on the Start page cannot be raised past whatever
+the shell already had configured. See the comment at the top of pymnpbem_gui.py.
 
 The GUI drives the pymnpbem_simulation wrapper, which is a separate repository
 and not a PyPI dependency, so `pip install PyMNPBEM[gui]` alone is not enough.
