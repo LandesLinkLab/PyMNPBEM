@@ -74,6 +74,10 @@ gui = [
     "pyyaml>=6.0",
     "python-box>=7.0",
     "h5py>=3.10",
+    # Lets the Start page's Threads setting reach BLAS. MKL/OpenBLAS latch their
+    # pools when NumPy is imported, which happens before any GUI code runs, so
+    # this is the only way to narrow them afterwards.
+    "threadpoolctl>=3.1",
 ]
 # All accelerators in one shot. pip resolves the nested extra on recent
 # versions (>=21.2); older pip should expand it manually:
@@ -96,7 +100,14 @@ Issues = "https://github.com/Yoo-LandesLinkLab/PyMNPBEM/issues"
 
 
 [project.scripts]
-pymnpbem-gui = "mnpbem.gui.gui_main:main"
+# Points at the top-level launcher, not mnpbem.gui.gui_main, so the thread-count
+# ceiling is set before mnpbem/__init__.py pulls in NumPy and Numba. See the
+# comment at the top of pymnpbem_gui.py.
+pymnpbem-gui = "pymnpbem_gui:main"
+
+
+[tool.setuptools]
+py-modules = ["pymnpbem_gui"]
 
 
 [tool.setuptools.packages.find]
