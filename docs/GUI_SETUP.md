@@ -67,8 +67,14 @@ pymnpbem-gui
 or, from a source checkout:
 
 ```bash
-python -m mnpbem.gui.gui_main
+python pymnpbem_gui.py
 ```
+
+Both go through `pymnpbem_gui.py`, which raises the thread-count ceiling before
+NumPy and Numba are imported. `python -m mnpbem.gui.gui_main` still opens the
+window but skips that step, so the Threads value on the Start page cannot be
+raised past whatever the shell already had configured -- use it only for
+debugging the window itself.
 
 If the wrapper is missing, the GUI exits immediately with a message naming the
 repository to clone, rather than a traceback from a page import.
@@ -115,6 +121,15 @@ cd PyMNPBEM              && git pull
 cd ../pymnpbem_simulation && git pull
 ```
 
-No reinstall is needed unless the dependencies change.
+No reinstall is needed unless the dependencies or the console-script entry point
+change. Both changed when the GUI launcher moved to `pymnpbem_gui.py`, so a pull
+across that commit needs one more step:
+
+```bash
+pip install -e "./PyMNPBEM[gui]"
+```
+
+Without it `pymnpbem-gui` keeps pointing at the old entry point and the Start
+page fails with "mnpbem already imported!" when you press Continue to Simulation.
 
 ## [Using the GUI](./GUI_GUIDE.md)
