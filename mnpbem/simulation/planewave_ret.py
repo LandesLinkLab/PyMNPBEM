@@ -206,8 +206,17 @@ class PlaneWaveRet(object):
         assert np.allclose(dot_prod, 0), "Polarization and propagation direction must be orthogonal"
 
         # MATLAB: field.m lines 31-34
-        # Index to excited faces
-        ind = np.where(p.inout[:, inout - 1] == self.medium)[0]
+        # Index to excited faces.
+        # p may be a ComParticle -- inout is (np, 2), inner and outer medium of
+        # every particle -- or a ComPoint, which carries one medium per point
+        # group. MATLAB indexes both with p.inout(:, inout) because a compoint's
+        # inout is an n x 1 matrix; NumPy needs the column made explicit, and
+        # inout = 2 has no second column to ask for on points.
+        inout_arr = np.asarray(p.inout)
+        if inout_arr.ndim == 1:
+            inout_arr = inout_arr[:, np.newaxis]
+        column = min(int(inout) - 1, inout_arr.shape[1] - 1)
+        ind = np.where(inout_arr[:, column] == self.medium)[0]
         # Get all face indices for excited particles
         face_indices = []
         for i in ind:
