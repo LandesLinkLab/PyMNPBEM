@@ -8,6 +8,7 @@ from PySide6.QtGui import QFont
 # (QRunnable doesn't inherit from QObject, so it needs a helper to emit signals)
 class LoaderSignals(QObject):
     finished = Signal()
+    failed = Signal(str)
     progress = Signal(str)
 
 # 2. Define the background task using QRunnable
@@ -17,12 +18,20 @@ class ImportLoader(QRunnable):
         self.signals = LoaderSignals()
 
     def run(self):
-        
-        self.signals.progress.emit("Loading Simulation Settings...")
-        from ..pages.simulation import SimulationPage
-        
-        self.signals.progress.emit("Loading Post-Processing Calculations...")
-        from ..pages.post_processing import ProcessingPage
+        # Anything raised in here (a missing pyvista, a broken user module, an
+        # error inside a page) has to come back as a signal. The dialog blocks
+        # closing until it hears from this thread, so an escaping exception
+        # leaves the window on screen with no way out but killing the process.
+        try:
+            self.signals.progress.emit("Loading Simulation Settings...")
+            from ..pages.simulation import SimulationPage
+
+            self.signals.progress.emit("Loading Post-Processing Calculations...")
+            from ..pages.post_processing import ProcessingPage
+
+        except BaseException as exc:
+            self.signals.failed.emit("{}: {}".format(type(exc).__name__, exc))
+            return
 
         self.signals.finished.emit()
 
@@ -37,7 +46,8 @@ class ImportProgressDialog(QDialog):
         self.setMinimumHeight(450)
         self.setWindowFlags(Qt.Window | Qt.WindowTitleHint | Qt.CustomizeWindowHint)
         self.allow_close = False
-        
+        self.error = None       # set when the background import raised; read by the caller
+
         self.init_ui()
         self.run_import()
 
@@ -91,6 +101,7 @@ class ImportProgressDialog(QDialog):
         self.loader = ImportLoader()
         self.loader.signals.progress.connect(self.update_status)
         self.loader.signals.finished.connect(self.on_import_finished)
+        self.loader.signals.failed.connect(self.on_import_failed)
         self.threadpool.start(self.loader)
     
     @Slot(str)
@@ -105,9 +116,18 @@ class ImportProgressDialog(QDialog):
         self.allow_close = True
         self.accept()  # This safely breaks the .exec() loop and returns QDialog.Accepted
 
+    @Slot(str)
+    def on_import_failed(self, message: str):
+        self.error = message
+        self.status_label.setText("Import failed: {}".format(message))
+        self.progress_bar.setMaximum(1)
+        self.progress_bar.setValue(0)
+        self.allow_close = True
+        self.reject()
+
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
-            event.ignore()  # Prevent Escape from closing it
+        if event.key() == Qt.Key_Escape and (not self.allow_close):
+            event.ignore()  # Prevent Escape from closing it while the import runs
         else:
             super().keyPressEvent(event)
     
