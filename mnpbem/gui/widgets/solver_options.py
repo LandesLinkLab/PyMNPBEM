@@ -96,23 +96,42 @@ class SolverOptionsWidget(QGroupBox):
         self.layout.addLayout(button_row)
 
     def _convert_units(self):
-        self.state.energy_max = EV2NM / self.state.energy_max
-        self.state.energy_min = EV2NM / self.state.energy_min
+        # nm and eV run in opposite directions: the shortest wavelength is the
+        # highest energy. Converting each box in place would leave Min above Max,
+        # which validate_state() rejects, so the endpoints swap with the unit.
+        converted_min = EV2NM / float(self.state.energy_max)
+        converted_max = EV2NM / float(self.state.energy_min)
 
-        if self.state.energy_in_nm:
-            self.max_box.setSuffix(" ev")
-            self.min_box.setSuffix(" ev")
+        to_ev = bool(self.state.energy_in_nm)
+
+        # Reconfiguring a spin box re-rounds whatever it still holds and emits
+        # valueChanged, which would write the old unit's number straight back
+        # into the state. Keep both boxes silent until they carry the new values,
+        # then read the state back from what they actually display.
+        for box in (self.min_box, self.max_box):
+            box.blockSignals(True)
+            # A useful range spans ~3 eV but ~1700 nm, so two decimals in eV
+            # would quantise the range into steps worth several nm.
+            box.setDecimals(4 if to_ev else 2)
+            box.setSuffix(" eV" if to_ev else " nm")
+
+        self.min_box.setValue(converted_min)
+        self.max_box.setValue(converted_max)
+
+        for box in (self.min_box, self.max_box):
+            box.blockSignals(False)
+
+        self.state.energy_min = float(self.min_box.value())
+        self.state.energy_max = float(self.max_box.value())
+
+        if to_ev:
             self.wavelength_group.setTitle("Energy Range")
             self.unit_button.setText("Change to nm")
         else:
-            self.max_box.setSuffix(" nm")
-            self.min_box.setSuffix(" nm")
             self.wavelength_group.setTitle("Wavelength Range")
             self.unit_button.setText("Change to eV")
 
-        self.min_box.setValue(self.state.energy_min)
-        self.max_box.setValue(self.state.energy_max)
-        self.state.energy_in_nm = not self.state.energy_in_nm
+        self.state.energy_in_nm = not to_ev
 
     def _radio_toggled(self):
         if self.fp32.isChecked():
