@@ -16,7 +16,7 @@ See docs/GUI_SETUP.md.
 """
 import sys
 from pathlib import Path
-from PySide6.QtWidgets import (QApplication, QMainWindow, QStackedWidget, QToolBar)
+from PySide6.QtWidgets import (QApplication, QMainWindow, QMessageBox, QStackedWidget, QToolBar)
 from PySide6.QtGui import QIcon, QAction
 
 
@@ -60,27 +60,43 @@ class MainController(QMainWindow):
         self.page1.settings_completed.connect(self.go_to_sim)
     def _ensure_runtime_pages(self):
         if self.page2 is not None and self.page3 is not None:
-            return
+            return True
 
         from .widgets.import_loading import ImportProgressDialog
         import_dialog = ImportProgressDialog(self)
         import_dialog.exec() # will block until import is done, (which means these pages should load fine)
 
-        # in case something failed, import again (python should skip it if it is already imported so no performance hit)
-        from .pages.simulation import SimulationPage
-        from .pages.post_processing import ProcessingPage
+        # A failed import leaves the pages unbuilt; staying on the Start page is
+        # the only safe move, and the reason has to reach the user.
+        try:
+            if import_dialog.error is not None:
+                raise RuntimeError(import_dialog.error)
 
-        self.page2 = SimulationPage(self.state)
-        self.page3 = ProcessingPage(self.state)
+            # in case something failed, import again (python should skip it if it is already imported so no performance hit)
+            from .pages.simulation import SimulationPage
+            from .pages.post_processing import ProcessingPage
 
-        
+            self.page2 = SimulationPage(self.state)
+            self.page3 = ProcessingPage(self.state)
+
+        except Exception as exc:
+            self.page2 = None
+            self.page3 = None
+            QMessageBox.critical(
+                self,
+                "Could Not Open Simulation Page",
+                "Loading the simulation and post-processing pages failed:\n\n{}".format(exc),
+                QMessageBox.Ok)
+            return False
 
         self.stacked_widget.addWidget(self.page2)
         self.stacked_widget.addWidget(self.page3)
         self.page2.sim_completed.connect(self.go_to_post)
+        return True
 
     def go_to_sim(self):
-        self._ensure_runtime_pages()
+        if not self._ensure_runtime_pages():
+            return
         self.page2.setup_ui_from_state()  # not really using this, but could be useful later (so leaving it in)
         self.stacked_widget.setCurrentWidget(self.page2)
     def go_to_post(self):
