@@ -381,9 +381,14 @@ class SimulationState:
         nm_min = float(self.energy_min)
         nm_max = float(self.energy_max)
         if not self.energy_in_nm:
-            # convert to nm with EV2NM helper
-            nm_min = float(nm_min / EV2NM)
-            nm_max = float(nm_max / EV2NM)
+            # EV2NM is a product constant (nm * eV), so the conversion is
+            # reciprocal -- dividing by it would yield sub-nm garbage -- and the
+            # endpoints swap because the smallest energy is the longest wavelength.
+            nm_min = EV2NM / float(self.energy_max)
+            nm_max = EV2NM / float(self.energy_min)
+
+        if nm_min > nm_max:
+            nm_min, nm_max = nm_max, nm_min
 
         # material resolution
         particle_name = None
@@ -589,7 +594,7 @@ class SimulationState:
 
         def _merge_result_payload(base: dict, extra: dict) -> dict:
             merged = dict(base)
-            for key in ("wavelength", "pos", "e", "h", "grid_shape", "inout"):
+            for key in ("wavelength", "pos", "e", "h", "grid_shape", "inout", "field_kind"):
                 if key in extra:
                     merged[key] = extra[key]
             if "n_pol" in extra and "n_pol" not in merged:
