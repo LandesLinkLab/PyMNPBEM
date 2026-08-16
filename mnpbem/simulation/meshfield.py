@@ -82,6 +82,14 @@ class MeshField(object):
         # Expand dimensions if needed (MATLAB: expand function)
         x, y, z = self._expand(x, y, z)
 
+        # Callers hold the simulation kind as a runner name -- 'stat_layer',
+        # 'ret_iter' and so on -- and _make_green() only tests for the exact
+        # string 'stat'. Anything else silently selected the retarded branch, so
+        # a quasistatic layer run built a retarded Green function and then died
+        # asking a quasistatic sigma for its surface currents. Normalise once,
+        # here, rather than trusting every caller to strip the suffix.
+        sim = 'stat' if str(sim).startswith('stat') else 'ret'
+
         # Layer structure (substrate). When present, the field is evaluated
         # with the layer-aware Green function (direct + reflected), matching
         # MATLAB @meshfield/init.m where greenfunction() dispatches to

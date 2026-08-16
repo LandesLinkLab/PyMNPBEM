@@ -289,7 +289,13 @@ class GreenTabLayer(object):
         else:
             idx = np.searchsorted(enei_arr, enei, side='right') - 1
             idx = np.clip(idx, 0, len(enei_arr) - 2)
-            frac = (enei - enei_arr[idx]) / (enei_arr[idx + 1] - enei_arr[idx])
+
+            # A single-wavelength run can be tabulated at two coincident
+            # wavelengths; the zero span then divides through and quietly turns
+            # the whole table -- and every field built from it -- into NaN.
+            # Coincident endpoints hold the same data, so either one will do.
+            span = enei_arr[idx + 1] - enei_arr[idx]
+            frac = 0.0 if span == 0 else (enei - enei_arr[idx]) / span
             for name in names:
                 self._Gsav_comp[name] = (1 - frac) * self._Gsav_multi[name][:, :, :, idx] + frac * self._Gsav_multi[name][:, :, :, idx + 1]
                 self._Frsav_comp[name] = (1 - frac) * self._Frsav_multi[name][:, :, :, idx] + frac * self._Frsav_multi[name][:, :, :, idx + 1]

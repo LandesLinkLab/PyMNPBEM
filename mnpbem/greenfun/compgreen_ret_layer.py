@@ -38,8 +38,32 @@ class _StructuredGreen(object):
         self.hs = hs if hs is not None else 0
 
 
+def _as_host(x):
+    """Bring a cupy array back to the host, leaving everything else untouched.
+
+    The helpers in this module use ``isinstance(x, np.ndarray)`` to tell a real
+    matrix from the scalar 0 that stands in for "no such Green-function block".
+    A cupy array fails that test, so a GPU-resident Green function used to be
+    read as an absent block and the term was silently dropped -- with a layered
+    substrate every term vanished, leaving a complex scalar where the field
+    array belonged. CompGreenRet._matmul() already promotes for this reason.
+    """
+    if hasattr(x, 'get') and not isinstance(x, np.ndarray):
+        from ..utils.gpu import to_host
+        return to_host(x)
+    return x
+
+
+def _is_matrix(x):
+    """True for a real (host or device) array, False for the scalar 0 sentinel."""
+    return hasattr(x, 'shape') and not np.isscalar(x)
+
+
 def _safe_matmul(A, x):
     """Matrix multiply handling zero and scalar cases."""
+    A = _as_host(A)
+    x = _as_host(x)
+
     if isinstance(A, (int, float)):
         if A == 0:
             return 0
@@ -180,8 +204,8 @@ def _matmul2_refl_3d(Gp_comp, sig, h, mode):
 
         parts = []
         for j in range(3):
-            ss_j = Gp_ss[:, :, j] if isinstance(Gp_ss, np.ndarray) else 0
-            sh_j = Gp_sh[:, :, j] if isinstance(Gp_sh, np.ndarray) else 0
+            ss_j = Gp_ss[:, :, j] if _is_matrix(Gp_ss) else 0
+            sh_j = Gp_sh[:, :, j] if _is_matrix(Gp_sh) else 0
             val = _safe_matmul(ss_j, sig)
             sh_val = _safe_matmul(sh_j, h_z)
             if isinstance(val, (int, float)) and val == 0:
@@ -260,13 +284,13 @@ def _cross_refl_3d(Gp_comp, sig, h):
         """Compute G(:,:,i1) @ h(:,i2,:) with structured decomposition."""
         if i2 in (0, 1):
             # Parallel component: use G.p
-            G_slice = Gp_p[:, :, i1] if isinstance(Gp_p, np.ndarray) else 0
+            G_slice = Gp_p[:, :, i1] if _is_matrix(Gp_p) else 0
             h_slice = h[:, i2] if h.ndim == 2 else h[:, i2, :]
             return _safe_matmul(G_slice, h_slice)
         else:
             # z component: use G.hh + G.hs
-            G_hh_slice = Gp_hh[:, :, i1] if isinstance(Gp_hh, np.ndarray) else 0
-            G_hs_slice = Gp_hs[:, :, i1] if isinstance(Gp_hs, np.ndarray) else 0
+            G_hh_slice = Gp_hh[:, :, i1] if _is_matrix(Gp_hh) else 0
+            G_hs_slice = Gp_hs[:, :, i1] if _is_matrix(Gp_hs) else 0
             hh_term = _safe_matmul(G_hh_slice, h_z)
             hs_term = _safe_matmul(G_hs_slice, sig)
             if isinstance(hh_term, (int, float)) and hh_term == 0:
@@ -322,7 +346,11 @@ def _add_safe(a, b):
 
 
 def _matmul(A, x):
-    # Generalized matrix multiply handling scalar/zero, 2D, and 3D cases
+    # Generalized matrix multiply handling scalar/zero, 2D, and 3D cases.
+    # A may live on the GPU while sigma stays on the host, and mixing the two
+    # in one product raises; promote first, as CompGreenRet._matmul does.
+    A = _as_host(A)
+    x = _as_host(x)
     if isinstance(A, (int, float)):
         if A == 0:
             return 0
@@ -331,7 +359,7 @@ def _matmul(A, x):
         if x == 0:
             return 0
         return A * x
-    if not isinstance(A, np.ndarray):
+    if not _is_matrix(A):
         return 0
 
     siz_a = A.shape
@@ -470,7 +498,7 @@ def _cross3(G, sig, name):
     # cross product: curl of G @ h
     if isinstance(G, (int, float)):
         return 0
-    if isinstance(G, np.ndarray) and G.size == 1:
+    if _is_matrix(G) and G.size == 1:
         return 0
 
     hx = _sub_safe(_matmul3(G, sig, name, 1, 2), _matmul3(G, sig, name, 2, 1))
