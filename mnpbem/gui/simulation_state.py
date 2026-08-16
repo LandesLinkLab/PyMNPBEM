@@ -242,12 +242,21 @@ class SimulationState:
         
         Returns (is_valid, error_message_or_empty_string)
         """
-        if not self.materials:
+        # StructureSettingsWidget seeds materials with a single None so index 0
+        # always exists for the Core Material dropdown, so a non-empty list does
+        # not mean a material was picked -- the backend used to receive
+        # particle=None and die on name.lower() deep inside the builder.
+        if not self.materials or not str(self.materials[0] or "").strip():
             return False, "No particle material selected"
-        
+
         if not self.environment_material:
             return False, "Environment material not selected"
-        
+
+        # to_dict() drops the substrate block when no material is set, so
+        # without this the run would silently come back without a substrate.
+        if self.use_substrate and not str(self.substrate_material or "").strip():
+            return False, "Enable Substrate is on, but no substrate material is selected"
+
         if self.energy_min >= self.energy_max:
             return False, "Energy min must be less than energy max"
         
