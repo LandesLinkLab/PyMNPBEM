@@ -8,6 +8,7 @@ import numpy as np
 from typing import Optional, List, Tuple, Any, Union
 
 from ..utils.matlab_compat import matan2, msqrt, macos
+from ..misc.distance_utils import distmin3
 
 
 class Point(object):
@@ -218,15 +219,16 @@ class ComPoint(object):
                 z_eligible = pos[eligible, 2]
                 zmin_vals, _ = layer.mindist(z_eligible)
                 on_interface = np.asarray(zmin_vals).ravel() < 1e-10
+                eligible_idx = np.where(eligible)[0]
                 if np.any(on_interface):
-                    eligible_idx = np.where(eligible)[0]
                     shift_idx = eligible_idx[on_interface]
                     pos[shift_idx, 2] = pos[shift_idx, 2] + 1e-8
-                    # Re-assign inout from the new z via indlayer -> layer.ind
-                    eligible_z = pos[eligible_idx, 2]
-                    new_layer_pos, _ = layer.indlayer(eligible_z)
-                    new_inout = layer_inds[np.asarray(new_layer_pos).ravel() - 1]
-                    inout_per_point[eligible_idx] = new_inout
+                # Re-assign inout of all eligible points from z via indlayer -> layer.ind
+                # (MATLAB @compoint/init.m L51: inout(indl) = layer.ind(indlayer(layer, z)))
+                eligible_z = pos[eligible_idx, 2]
+                new_layer_pos, _ = layer.indlayer(eligible_z)
+                new_inout = layer_inds[np.asarray(new_layer_pos).ravel() - 1]
+                inout_per_point[eligible_idx] = new_inout
 
         # Group points by medium
         unique_media = np.unique(inout_per_point[inout_per_point > 0])
@@ -269,36 +271,32 @@ class ComPoint(object):
         if not hasattr(comparticle, 'p') or len(comparticle.p) == 0:
             return inout_per_point
 
-        # For each point, find signed distance to nearest face
-        for ip, particle in enumerate(comparticle.p):
-            if not hasattr(particle, 'pos') or particle.pos.shape[0] == 0:
-                continue
+        # MATLAB @compoint/init.m L17-L37: signed distance to the nearest face of all particles
+        # (distmin3), points closer than mindist to the boundary are dropped (inout = 0)
+        n_part = len(comparticle.p)
+        mindist = np.atleast_1d(np.asarray(mindist, dtype = np.float64)).ravel()
+        if mindist.size != n_part:
+            mindist = np.tile(mindist, n_part)
 
-            # Compute distance from each point to nearest face centroid
-            face_pos = particle.pos  # (nfaces, 3)
-            for j in range(npts):
-                diff = face_pos - pos[j]
-                dists = msqrt(np.sum(diff ** 2, axis = 1))
-                imin = np.argmin(dists)
-                r = dists[imin]
+        # ComParticleMirror has no concatenated particle pc, MATLAB uses the particles p
+        pc = comparticle.pc if hasattr(comparticle, 'pc') else comparticle.p[0].vertcat(*comparticle.p[1:])
+        r = np.empty(npts, dtype = np.float64)
+        ind2 = np.empty(npts, dtype = int)
+        # distmin3 builds a (npos, nfaces) distance matrix, work off positions in portions of 1000
+        for i0 in range(0, npts, 1000):
+            r[i0:i0 + 1000], ind2[i0:i0 + 1000] = distmin3(pc, pos[i0:i0 + 1000], np.max(mindist))
 
-                if r < np.abs(mindist) if np.isscalar(mindist) else np.abs(mindist[ip]):
-                    # Too close: mark as invalid
-                    inout_per_point[j] = 0
-                    continue
+        # conversion table between face indices and particle number
+        ind2part = np.repeat(np.arange(n_part), [part.nfaces for part in comparticle.p])[ind2]
+        inout = np.atleast_2d(comparticle.inout)
 
-                # Determine inside/outside using normal vector
-                if hasattr(particle, 'nvec') and particle.nvec.shape[0] > 0:
-                    nvec = particle.nvec[imin]
-                    direction = pos[j] - face_pos[imin]
-                    sign = np.dot(direction, nvec)
-                    if sign >= 0:
-                        # outside
-                        inout_val = int(comparticle.inout[ip, 1])
-                    else:
-                        # inside
-                        inout_val = int(comparticle.inout[ip, 0])
-                    inout_per_point[j] = inout_val
+        # depending on the sign of r, the point is in- or outside the nearest surface
+        keep = np.abs(r) >= mindist[ind2part]
+        inside = keep & (r < 0)
+        outside = keep & (r >= 0)
+        inout_per_point = np.zeros(npts, dtype = int)
+        inout_per_point[inside] = inout[ind2part[inside], 0]
+        inout_per_point[outside] = inout[ind2part[outside], 1]
 
         return inout_per_point
 

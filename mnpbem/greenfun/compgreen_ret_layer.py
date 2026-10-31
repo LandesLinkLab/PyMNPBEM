@@ -17,6 +17,7 @@ from typing import List, Dict, Tuple, Optional, Union, Any, Callable
 
 import numpy as np
 
+from ..geometry.compoint import ComPoint
 from .compgreen_ret import CompGreenRet
 from .compgreen_stat import CompStruct
 from .greenret_layer import GreenRetLayer
@@ -591,7 +592,11 @@ class CompGreenRetLayer(object):
         #   ind1 = find( any( inout1 == layer.ind, 2 ) )
         # i.e. faces whose OUTSIDE medium index belongs to layer.ind
         def _layer_faces(p, layer_ind):
-            if hasattr(p, 'expand') and hasattr(p, 'inout'):
+            if isinstance(p, ComPoint):
+                # COMPOINT inout is a column with one medium per point group
+                # (@compoint/init.m L64), expand it to the points of the masked groups
+                face_medium = np.repeat(p.inout[p._mask], [p.p[i].n for i in p._mask])
+            elif hasattr(p, 'expand') and hasattr(p, 'inout'):
                 inout_last = np.atleast_2d(p.inout)[:, -1]
                 try:
                     face_medium = p.expand([int(v) for v in inout_last])
@@ -614,8 +619,10 @@ class CompGreenRetLayer(object):
         # MATLAB eval1.m line 33: i1 == size(obj.p1.inout, 2) && i2 == 2
         # Python 0-based: i == n_regions_p1 - 1 && j == 1
         if hasattr(self.p1, 'inout'):
-            inout1 = np.atleast_2d(self.p1.inout)
-            n_regions = inout1.shape[1]
+            inout1 = np.asarray(self.p1.inout)
+            # ComPoint stores inout as 1D (one medium per point group), which is
+            # the MATLAB COMPOINT column (n x 1): a single region
+            n_regions = inout1.shape[1] if inout1.ndim == 2 else 1
         else:
             n_regions = 2
         return i == n_regions - 1 and j == 1
