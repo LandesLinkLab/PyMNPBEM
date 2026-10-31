@@ -8,7 +8,7 @@ MATLAB: Greenfun/@compgreenret/
 """
 
 import numpy as np
-from typing import Optional, Tuple, Any, List
+from typing import Optional, Tuple, Any, List, Callable
 
 from mnpbem.utils.matlab_compat import msqrt
 
@@ -105,6 +105,10 @@ class CompGreenRet(object):
         if not isinstance(self, CompGreenRet):
             return
         options.pop('hmatrix', None)
+        # Optional refinement hook (e.g. coverlayer.refine), applied once to
+        # the refined Taylor coefficients in _init.
+        # MATLAB: Greenfun/@greenret/private/init.m line 187
+        self._refun = options.pop('refun', None)
         self.p1 = p1
         self.p2 = p2
         self.deriv = options.get('deriv', 'cart')
@@ -137,6 +141,11 @@ class CompGreenRet(object):
         # Split Green function into cell array
         # MATLAB: obj.g = mat2cell(g, p1.p, p2.p)
         self.g = self._mat2cell(g, p1.p, p2.p)
+
+        # User refinement of the Taylor coefficients, before the closed-surface
+        # correction as in MATLAB (greenret init, then initclosed)
+        if self._refun is not None:
+            self._apply_refun(self._refun)
 
         # Apply closed-surface corrections to diagonal blocks
         # MATLAB: @greenret/diag.m modifies f(ind, 1) coefficients
@@ -190,6 +199,48 @@ class CompGreenRet(object):
         }
 
         return g
+
+    def _apply_refun(self, refun: Callable) -> None:
+        # MATLAB keeps one greenret with global obj.ind, obj.g, obj.f; here the
+        # refined coefficients live per particle-pair block, so gather them into
+        # a global view, refine, and scatter the rows back.
+        blocks = []
+        for row in self.g:
+            for blk in row:
+                ref = getattr(blk, 'refined', None)
+                if ref is not None and len(ref.row) > 0:
+                    blocks.append(blk)
+        if not blocks:
+            return
+
+        n_ref = [len(blk.refined.row) for blk in blocks]
+        n_tot = sum(n_ref)
+        ref0 = blocks[0].refined
+
+        ind = np.empty((n_tot, 2), dtype = int)
+        g = np.empty((n_tot,) + ref0.g.shape[1:], dtype = ref0.g.dtype)
+        f = np.empty((n_tot,) + ref0.f.shape[1:], dtype = ref0.f.dtype)
+        offset = 0
+        for blk, n in zip(blocks, n_ref):
+            ref = blk.refined
+            ind[offset:offset + n, 0] = blk.i1_start + ref.row
+            ind[offset:offset + n, 1] = blk.i2_start + ref.col
+            g[offset:offset + n] = ref.g
+            f[offset:offset + n] = ref.f
+            offset += n
+
+        view = GreenRetRefunView(self.p1, self.p2, ind, ref0.order, ref0.deriv)
+        g_shape, f_shape = g.shape, f.shape
+        g, f = refun(view, g, f)
+        assert g.shape == g_shape and f.shape == f_shape, \
+            '[error] <refun> must return g, f with unchanged shapes!'
+
+        offset = 0
+        for blk, n in zip(blocks, n_ref):
+            ref = blk.refined
+            ref.g = np.ascontiguousarray(g[offset:offset + n])
+            ref.f = np.ascontiguousarray(f[offset:offset + n])
+            offset += n
 
     def _initclosed(self, g, p1, p2, **options):
         """
@@ -1559,6 +1610,23 @@ class CompGreenRet(object):
                 len(self.g), len(self.g[0]) if self.g else 0,
                 self.hmode)
         )
+
+
+class GreenRetRefunView(object):
+    # Global view of the refined elements of a CompGreenRet, passed to refun.
+    # MATLAB: greenret object with ind, order, deriv (Greenfun/@greenret)
+
+    def __init__(self,
+            p1: Any,
+            p2: Any,
+            ind: np.ndarray,
+            order: int,
+            deriv: str) -> None:
+        self.p1 = p1
+        self.p2 = p2
+        self.ind = ind
+        self.order = order
+        self.deriv = deriv
 
 
 class GreenRetSimple(object):

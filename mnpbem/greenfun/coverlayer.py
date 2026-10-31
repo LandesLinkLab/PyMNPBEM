@@ -14,7 +14,9 @@ This module implements:
      when initializing the Green function to recompute entries for neighbour
      cover-layer elements via polar integration.
   3. refineret(obj, g, f, p, ind), refinestat(obj, g, f, p, ind): the actual
-     polar-integration refinement of Green function matrices g, f.
+     polar-integration refinement of the Green function data g, f (Taylor
+     coefficients of the refined elements for refineret, full matrices for
+     refinestat).
 """
 
 import math
@@ -178,7 +180,8 @@ def refine(p: Any, ind: np.ndarray) -> Callable:
     -------
     fun : callable
         Signature: fun(obj, g, f) -> (g, f). `obj` is a greenstat or greenret
-        instance; (g, f) are the Green function matrices to be refined in-place.
+        instance; (g, f) are its full Green function matrices (greenstat) or
+        the Taylor coefficients of its refined elements (greenret).
     """
     ind = np.asarray(ind)
     if ind.ndim == 1:
@@ -244,9 +247,9 @@ def _select_pair_elements(p: Any,
     if obj_ind.size == 0:
         mapping = -np.ones_like(lin)
     elif obj_ind.ndim == 2 and obj_ind.shape[1] == 2:
-        lin_obj = obj_ind[:, 0].astype(int) * n + obj_ind[:, 1].astype(int)
-        lookup = {int(v): k for k, v in enumerate(lin_obj)}
-        mapping = np.array([lookup.get(int(x), -1) for x in lin])
+        # (row, col) keys stay unique when obj has more columns than rows
+        lookup = {(int(r), int(c)): k for k, (r, c) in enumerate(obj_ind)}
+        mapping = np.array([lookup.get((int(r), int(c)), -1) for r, c in zip(i1, i2)])
     else:
         lookup = {int(v): k for k, v in enumerate(obj_ind.ravel())}
         mapping = np.array([lookup.get(int(x), -1) for x in lin])
@@ -285,18 +288,17 @@ def refineret(obj: Any,
         p: Any,
         ind_pairs: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Refine retarded Green function matrices via polar integration.
+    Refine retarded Green function coefficients via polar integration.
 
     MATLAB: Greenfun/+coverlayer/refineret.m
 
-    The Python port differs from MATLAB in storage layout: here `g` and `f`
-    are full (n1, n2) matrices (rather than per-refined-element arrays of
-    Taylor coefficients) and refinement is written directly into matrix
-    cells. For order > 0 we accumulate the Taylor series weighted by
-    (ik)^ord -- the same summation that MATLAB's eval1.m performs when
-    expanding `obj.g(:, ord+1)`.
+    As in MATLAB, `g` and `f` are the wavelength-independent Taylor
+    coefficients of the refined elements listed in `obj.ind`
+    (g: (n_ref, order+1); f: (n_ref, 3, order+1) for deriv='cart' or
+    (n_ref, order+1) for deriv='norm'). The wavenumber enters only later,
+    when the Green function is evaluated.
     """
-    i1, i2, _ = _select_pair_elements(p, obj, ind_pairs)
+    i1, i2, ind = _select_pair_elements(p, obj, ind_pairs)
     if i1.size == 0:
         return g, f
 
@@ -341,22 +343,34 @@ def refineret(obj: Any,
     def quad(vals: np.ndarray) -> np.ndarray:
         return np.bincount(pair_key, weights = weight_all * vals, minlength = len(i1))
 
-    k = getattr(obj, 'k', getattr(obj, '_k', 0.0))
-    order = getattr(obj, 'order', 0)
+    order = obj.order
 
-    g_accum = np.zeros(len(i1), dtype = complex)
+    # Green function
     for ordv in range(order + 1):
-        g_accum += (1j * k) ** ordv * quad((r - r0) ** ordv / (r * math.factorial(ordv)))
-    g[i1, i2] = g_accum
+        g[ind, ordv] = quad((r - r0) ** ordv / (r * math.factorial(ordv)))
 
-    nvec = pc.nvec
-    inp = (x * nvec[ind1, 0] + y * nvec[ind1, 1] + z * nvec[ind1, 2])
-    f_accum = -quad(inp / r ** 3).astype(complex)
-    for ordv in range(1, order + 1):
-        term = inp * ((r - r0) ** ordv / (r ** 3 * math.factorial(ordv))
-                      + (r - r0) ** (ordv - 1) / (r ** 2 * math.factorial(ordv - 1)))
-        f_accum += (1j * k) ** ordv * quad(term)
-    f[i1, i2] = f_accum
+    # Surface derivative of Green function
+    if obj.deriv == 'norm':
+        nvec = pc.nvec
+        inp = x * nvec[ind1, 0] + y * nvec[ind1, 1] + z * nvec[ind1, 2]
+        f[ind, 0] = -quad(inp / r ** 3)
+        # MATLAB refineret.m uses + for the first term here (greenret init uses -)
+        for ordv in range(1, order + 1):
+            f[ind, ordv] = quad(inp * ((r - r0) ** ordv / (r ** 3 * math.factorial(ordv))
+                    + (r - r0) ** (ordv - 1) / (r ** 2 * math.factorial(ordv - 1))))
+    else:
+        def fun(vals: np.ndarray) -> np.ndarray:
+            # (n_pairs, 3)
+            out = np.empty((len(i1), 3))
+            out[:, 0] = quad(x * vals)
+            out[:, 1] = quad(y * vals)
+            out[:, 2] = quad(z * vals)
+            return out
+
+        f[ind, :, 0] = -fun(1.0 / r ** 3)
+        for ordv in range(1, order + 1):
+            f[ind, :, ordv] = fun(-(r - r0) ** ordv / (r ** 3 * math.factorial(ordv))
+                    + (r - r0) ** (ordv - 1) / (r ** 2 * math.factorial(ordv - 1)))
 
     return g, f
 

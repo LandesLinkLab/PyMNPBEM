@@ -533,20 +533,19 @@ class BEMRetIter(BEMIter):
         self._G2 = None
         self._H2 = None
 
-        # User-supplied refinement hook (e.g. coverlayer.refine). Stripped
-        # before forwarding to CompGreenRet, applied at the BEM matrix
-        # level inside _init_matrices(). MATLAB bemretiter forwards refun
-        # via varargin → compgreenretiter → greenret/private/init.m.
+        # User-supplied refinement hook (e.g. coverlayer.refine). Forwarded
+        # to the dense CompGreenRet, which applies it to the refined Taylor
+        # coefficients. MATLAB bemretiter forwards refun via varargin →
+        # compgreenretiter → greenret/private/init.m.
         self._refun = options.pop('refun', None)
         self._op = options
 
-        # H-matrix path is incompatible with refun for now (refun densifies
-        # G/H pairs, defeating the compression). Fall back to dense if both
-        # are requested.
+        # H-matrix path does not forward refun to ACACompGreenRet yet, so the
+        # refinement would be dropped silently.
         if self._hmatrix and self._refun is not None:
             raise NotImplementedError(
                 '[error] BEMRetIter <hmatrix> + <refun> not supported '
-                '(refun densifies the Green pairs). Disable one.')
+                '(refun is not forwarded to the H-matrix Green function). Disable one.')
 
         # Green function. With ``hmatrix=True`` we pull the ACA wrapper from
         # mnpbem.greenfun; otherwise the dense CompGreenRet is used (legacy
@@ -582,7 +581,7 @@ class BEMRetIter(BEMIter):
             self.g = ACACompGreenRet(p, **aca_kwargs, **options)
         else:
             from ..greenfun import CompGreenRet
-            self.g = CompGreenRet(p, p, **options)
+            self.g = CompGreenRet(p, p, refun = self._refun, **options)
 
     def _init_matrices(self,
             enei: float) -> 'BEMRetIter':
@@ -683,21 +682,6 @@ class BEMRetIter(BEMIter):
                 _val = getattr(self, _attr)
                 if is_cupy_array(_val):
                     setattr(self, _attr, to_host(_val))
-
-        # Optional user-supplied refinement (coverlayer.refine for nonlocal
-        # cover-layer effects). Applied to dense G/H pairs. If ACA H-matrix
-        # acceleration is in use the matrices are densified for refun and
-        # the refined dense result is kept (refun touches a small set of
-        # face pairs, so densification is acceptable here).
-        if self._refun is not None:
-            G1 = self._G1.full() if hasattr(self._G1, 'full') and not isinstance(self._G1, np.ndarray) else self._G1
-            H1 = self._H1.full() if hasattr(self._H1, 'full') and not isinstance(self._H1, np.ndarray) else self._H1
-            G2 = self._G2.full() if hasattr(self._G2, 'full') and not isinstance(self._G2, np.ndarray) else self._G2
-            H2 = self._H2.full() if hasattr(self._H2, 'full') and not isinstance(self._H2, np.ndarray) else self._H2
-            G1, H1 = self._refun(self.g, G1, H1)
-            G2, H2 = self._refun(self.g, G2, H2)
-            self._G1, self._H1 = G1, H1
-            self._G2, self._H2 = G2, H2
 
         # Initialize preconditioner
         if self.precond is not None:

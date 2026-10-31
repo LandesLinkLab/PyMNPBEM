@@ -221,10 +221,10 @@ class BEMRet(object):
 
             refun : callable, optional
                 User-supplied Green-function refinement hook with signature
-                ``fun(obj, g, f) -> (g, f)``. Applied to the assembled
-                ``(G1, H1)`` and ``(G2, H2)`` Green matrix pairs after each
-                ``init(enei)`` so cover-layer / nonlocal effective-layer
-                geometries can inject polar-integration corrections.
+                ``fun(obj, g, f) -> (g, f)``. Applied once by CompGreenRet to
+                the wavelength-independent Taylor coefficients of the refined
+                elements, so cover-layer / nonlocal effective-layer geometries
+                can inject polar-integration corrections.
                 MATLAB equivalent: ``bemsolver(p, op, 'refun', ...)``
                 (see ``Greenfun/@greenret/private/init.m`` line 187).
             schur : bool or 'auto', optional
@@ -261,9 +261,9 @@ class BEMRet(object):
         self.Sigma_lu = None
 
         # Optional user-supplied refinement hook (e.g. coverlayer.refine).
-        # Pulled out of `options` so it is not passed down to CompGreenRet
-        # (CompGreenRet itself does not yet handle 'refun'; refinement is
-        # applied at the BEM-matrix level in init() / _init_gpu_assemble()).
+        # Passed to CompGreenRet, which applies it once to the refined Taylor
+        # coefficients (MATLAB Greenfun/@greenret/private/init.m line 187), so
+        # every wavelength and backend evaluates the refined Green function.
         self.options = dict(options)
         self._refun = self.options.pop('refun', None)
 
@@ -286,7 +286,7 @@ class BEMRet(object):
         # excitation object created afterwards (e.g. EELSRet with refine=2)
         # could mutate p.quad and the BEM Green matrix would silently use the
         # refined rule.
-        self.g = CompGreenRet(self.p, self.p, **self.options)
+        self.g = CompGreenRet(self.p, self.p, refun = self._refun, **self.options)
 
         # Initialize at specific energy if provided
         if enei is not None:
@@ -423,16 +423,6 @@ class BEMRet(object):
 
         H1_mat = H11 - H21 if not (isinstance(H21, int) and H21 == 0) else H11
         H2_mat = H22 - H12 if not (isinstance(H12, int) and H12 == 0) else H22
-
-        # Optional user-supplied refinement (coverlayer.refine for
-        # nonlocal cover-layer effects).  Applied to the assembled BEM
-        # matrices BEFORE LU factorization so downstream solves use the
-        # refined operators.  Mirrors MATLAB's per-greenret refun call at
-        # Greenfun/@greenret/private/init.m line 187, but lifted to the
-        # combined (G1, H1) / (G2, H2) pairs.
-        if self._refun is not None:
-            G1, H1_mat = self._refun(self.g, G1, H1_mat)
-            G2, H2_mat = self._refun(self.g, G2, H2_mat)
 
         # LU factorizations of Green functions. Honor MNPBEM_VRAM_SHARE_* for
         # multi-GPU dispatch on large meshes (1 worker pools VRAM across GPUs).
@@ -685,11 +675,6 @@ class BEMRet(object):
         _clear_green_distance_cache(self.g)
         cp.cuda.runtime.deviceSynchronize()
         _mempool.free_all_blocks()
-
-        # Optional user-supplied refun (coverlayer.refine) — host numpy.
-        if self._refun is not None:
-            G1_h, H1_h = self._refun(self.g, G1_h, H1_h)
-            G2_h, H2_h = self._refun(self.g, G2_h, H2_h)
 
         # Upload the four host matrices for the on-device
         # LU/Sigma pipeline.  The Green distance cache is gone, so the
@@ -1144,13 +1129,6 @@ class BEMRet(object):
             shape=(N, N), dtype=dtype, n_gpus=n_gpus,
             device_ids=device_ids, eval_func=_eval_G1)
 
-        # Optional user refun (coverlayer.refine). Refun is host numpy
-        # only; we have to gather/refine/scatter. Memory cost: one host
-        # (N, N) ~ 3.6 GB at 15k faces — fine on 503 GB host RAM.
-        if self._refun is not None:
-            G1_h = G1_dm.to_host()
-            # H1 needed too for refun. Build H1 first below.
-
         # Factor G1 in place. After this call, the distributed tiles of
         # G1_dm hold the L/U factors; do not reuse G1_dm as a Green
         # function thereafter (the math equations use only G1^{-1}).
@@ -1165,8 +1143,6 @@ class BEMRet(object):
         G2_dm = DistributedMatrix.from_func(
             shape=(N, N), dtype=dtype, n_gpus=n_gpus,
             device_ids=device_ids, eval_func=_eval_G2)
-        if self._refun is not None:
-            G2_h = G2_dm.to_host()
         G2_mglu = G2_dm.lu_factor()
         G2_mglu._distmat_keepalive = G2_dm  # type: ignore[attr-defined]
         self.G2_lu = ('mgpu', G2_mglu, None)
@@ -1186,50 +1162,12 @@ class BEMRet(object):
         H1_dm.free()
         del H1_dm
 
-        if self._refun is not None:
-            G1_h, H1_host = self._refun(self.g, G1_h, H1_host)
-            # Re-factor G1 with refined data (overwrite mgpu handle).
-            # Free the old LU first to release distributed memory.
-            try:
-                G1_mglu.close()
-            except Exception:
-                pass
-            # Also free the original G1_dm tiles (its ndarrays kept the
-            # device buffers alive while the old LU pointed at them).
-            try:
-                G1_dm.free()
-            except Exception:
-                pass
-            G1_dm_re = DistributedMatrix.from_host(
-                G1_h, n_gpus=n_gpus, device_ids=device_ids)
-            G1_mglu = G1_dm_re.lu_factor()
-            G1_mglu._distmat_keepalive = G1_dm_re  # keep buffers alive
-            self.G1_lu = ('mgpu', G1_mglu, None)
-            del G1_h
-
         H2_dm = DistributedMatrix.from_func(
             shape=(N, N), dtype=dtype, n_gpus=n_gpus,
             device_ids=device_ids, eval_func=_eval_H2)
         H2_host = H2_dm.to_host()
         H2_dm.free()
         del H2_dm
-
-        if self._refun is not None:
-            G2_h, H2_host = self._refun(self.g, G2_h, H2_host)
-            try:
-                G2_mglu.close()
-            except Exception:
-                pass
-            try:
-                G2_dm.free()
-            except Exception:
-                pass
-            G2_dm_re = DistributedMatrix.from_host(
-                G2_h, n_gpus=n_gpus, device_ids=device_ids)
-            G2_mglu = G2_dm_re.lu_factor()
-            G2_mglu._distmat_keepalive = G2_dm_re
-            self.G2_lu = ('mgpu', G2_mglu, None)
-            del G2_h
 
         # Sigma1 = H1 @ G1^{-1}.
         # cusolverMgGetrs supports only trans='N' in practice (the 'T' /
@@ -1275,22 +1213,17 @@ class BEMRet(object):
             # distributed solves: X = G1^{-1} @ eps1 (n,n) then
             # L1 = G1 @ X. Gather G1 once to host for the second matmul
             # (we lost the dense G1 to the in-place LU; rebuild it via
-            # one extra distributed assembly when refun did not retain
-            # a host copy).
-            if self._refun is not None:
-                G1_h_for_L = G1_h
-                G2_h_for_L = G2_h
-            else:
-                _tmp_G1 = DistributedMatrix.from_func(
-                    shape=(N, N), dtype=dtype, n_gpus=n_gpus,
-                    device_ids=device_ids, eval_func=_eval_G1)
-                G1_h_for_L = _tmp_G1.to_host()
-                _tmp_G1.free()
-                _tmp_G2 = DistributedMatrix.from_func(
-                    shape=(N, N), dtype=dtype, n_gpus=n_gpus,
-                    device_ids=device_ids, eval_func=_eval_G2)
-                G2_h_for_L = _tmp_G2.to_host()
-                _tmp_G2.free()
+            # one extra distributed assembly).
+            _tmp_G1 = DistributedMatrix.from_func(
+                shape=(N, N), dtype=dtype, n_gpus=n_gpus,
+                device_ids=device_ids, eval_func=_eval_G1)
+            G1_h_for_L = _tmp_G1.to_host()
+            _tmp_G1.free()
+            _tmp_G2 = DistributedMatrix.from_func(
+                shape=(N, N), dtype=dtype, n_gpus=n_gpus,
+                device_ids=device_ids, eval_func=_eval_G2)
+            G2_h_for_L = _tmp_G2.to_host()
+            _tmp_G2.free()
             X1 = _mg_solve_chunked(G1_mglu, np.ascontiguousarray(self.eps1))
             X2 = _mg_solve_chunked(G2_mglu, np.ascontiguousarray(self.eps2))
             self.L1 = G1_h_for_L @ X1
