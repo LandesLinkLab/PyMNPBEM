@@ -680,7 +680,11 @@ def tricube(n: int,
     p5 = Particle(np.column_stack([z, x, y]), faces)
     p6 = Particle(np.column_stack([-z, y, x]), faces)
 
-    p = (p1 + p2 + p3 + p4 + p5 + p6).clean()
+    # MATLAB calls clean() here. It is left out: before the super-sphere mapping the
+    # face-centre elements are shrunk by the power 1/e (~1e-7 wide for n=24, e=0.2),
+    # so clean() dropped them as too small and left a hole in each face. Its vertex
+    # merge never reached the result, which is built from verts2/faces2.
+    p = p1 + p2 + p3 + p4 + p5 + p6
 
     # Convert to spherical coordinates for super-sphere rounding
     phi_sph, theta_sph = _cart2sph(p.verts2[:, 0], p.verts2[:, 1], p.verts2[:, 2])
