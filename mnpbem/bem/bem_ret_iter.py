@@ -28,7 +28,10 @@ from .bem_iter import BEMIter
 # sweep on 12672-face Au@Ag dimers.
 try:
     import cupy as _cp_iter  # type: ignore
-    _CUPY_OK_ITER = True
+    # cupy importable is not enough: a CPU-only node or CUDA_VISIBLE_DEVICES=""
+    # imports cupy but has no device, so the pool/sync calls below raise
+    # cudaErrorNoDevice.  Require a device, as in bem_stat_iter.py.
+    _CUPY_OK_ITER = _cp_iter.cuda.runtime.getDeviceCount() > 0
 except Exception:
     _cp_iter = None  # type: ignore
     _CUPY_OK_ITER = False
