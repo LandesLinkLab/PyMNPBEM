@@ -274,7 +274,7 @@ class BEMRetMirror(object):
         self._Sigma2 = []
         self._Delta_lu = []
 
-        con_cross_zero = True  # check if cross connectivity is zero
+        con_cross_zero = np.all(self.g.con[0][1] == 0)  # check if cross connectivity is zero
         # MATLAB: if all(obj.g.con{1,2} == 0)
 
         for i in range(n_sym):
@@ -471,7 +471,7 @@ class BEMRetMirror(object):
         self._G2_dm = []
         self._Delta_dm = []
 
-        con_cross_zero = True  # mirror solver assumption (matches legacy)
+        con_cross_zero = np.all(self.g.con[0][1] == 0)  # MATLAB: if all(obj.g.con{1,2} == 0)
 
         for i in range(n_sym):
             # --------- Distributed LU of G1[i] -----------------------
