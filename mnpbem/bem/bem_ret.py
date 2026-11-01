@@ -1177,14 +1177,15 @@ class BEMRet(object):
         # faces; H1 host already materialized; on a 503 GB host RAM
         # node both fit comfortably and the (n,n)@(n,n) matmul lands on
         # MKL with ~7 TFLOPS = ~6 s at N=15k.
+        # G1_inv / G2_inv are kept until the L matrices below.
         I_host = np.eye(N, dtype=dtype)
         G1_inv = _mg_solve_chunked(G1_mglu, I_host)
         Sigma1_host = np.ascontiguousarray(H1_host @ G1_inv)
-        del G1_inv, H1_host
+        del H1_host
 
         G2_inv = _mg_solve_chunked(G2_mglu, I_host)
         Sigma2_host = np.ascontiguousarray(H2_host @ G2_inv)
-        del G2_inv, H2_host, I_host
+        del H2_host, I_host
         _gc.collect()
 
         # G1_dm / G2_dm are now attached to G1_mglu / G2_mglu via the
@@ -1208,10 +1209,13 @@ class BEMRet(object):
         if np.all(_gobj.con[0][1] == 0) or scalar_eps:
             self.L1 = self.eps1
             self.L2 = self.eps2
+            del G1_inv, G2_inv
         else:
-            # Full case: L1 = G1 @ eps1 @ G1^{-1}.  Compute via two
-            # distributed solves: X = G1^{-1} @ eps1 (n,n) then
-            # L1 = G1 @ X. Gather G1 once to host for the second matmul
+            # Full case: L1 = G1 @ eps1 @ G1^{-1} (MATLAB
+            # bemret/private/initmat.m).  eps1 is diagonal, so
+            # X = eps1 @ G1^{-1} is a row scaling of the inverse kept
+            # from the Sigma stage, then L1 = G1 @ X. Gather G1 once to
+            # host for this matmul
             # (we lost the dense G1 to the in-place LU; rebuild it via
             # one extra distributed assembly).
             _tmp_G1 = DistributedMatrix.from_func(
@@ -1224,8 +1228,9 @@ class BEMRet(object):
                 device_ids=device_ids, eval_func=_eval_G2)
             G2_h_for_L = _tmp_G2.to_host()
             _tmp_G2.free()
-            X1 = _mg_solve_chunked(G1_mglu, np.ascontiguousarray(self.eps1))
-            X2 = _mg_solve_chunked(G2_mglu, np.ascontiguousarray(self.eps2))
+            X1 = eps1_vals[:, None] * G1_inv
+            X2 = eps2_vals[:, None] * G2_inv
+            del G1_inv, G2_inv
             self.L1 = G1_h_for_L @ X1
             self.L2 = G2_h_for_L @ X2
             del G1_h_for_L, G2_h_for_L, X1, X2
