@@ -19,8 +19,9 @@ from scipy.linalg import lu_factor, lu_solve
 import os
 from ..utils.gpu import (
     lu_factor_dispatch, lu_solve_dispatch, lu_solve_native, matmul_dispatch,
-    eye_like_lu, lu_backend, to_host, is_cupy_array,
+    eye_like_lu, lu_backend, to_host, is_cupy_array, keep_cuda_device,
 )
+from ..utils import gpu as _gpu_mod
 from ..greenfun import CompGreenRet, CompStruct
 
 # When MNPBEM_GPU=1 and cupy is importable, the
@@ -37,9 +38,12 @@ except Exception:
 
 
 def _bem_assembly_use_gpu() -> bool:
+    # utils.gpu.use_gpu(): MNPBEM_GPU=1 (read per call) and a visible device
+    # (without a device BEMRet takes the CPU path directly instead of failing
+    # in the GPU one)
     if not _CUPY_OK_A2:
         return False
-    return os.environ.get('MNPBEM_GPU', '0') == '1'
+    return _gpu_mod.use_gpu()
 
 
 def _clear_green_distance_cache(green) -> None:
@@ -75,7 +79,7 @@ def _vram_share_lu_kwargs() -> dict:
 
     Returns ``{}`` when VRAM-share is not enabled (n_gpus<=1).
     """
-    if os.environ.get('MNPBEM_VRAM_SHARE', '0') != '1':
+    if not _gpu_mod.use_gpu() or os.environ.get('MNPBEM_VRAM_SHARE', '0') != '1':
         return {}
     n_gpus = int(os.environ.get('MNPBEM_VRAM_SHARE_GPUS', '1'))
     if n_gpus <= 1:
@@ -92,7 +96,7 @@ def _bem_native_gpu() -> bool:
     """
     if not _CUPY_OK_A2:
         return False
-    if os.environ.get('MNPBEM_GPU', '0') != '1':
+    if not _gpu_mod.use_gpu():
         return False
     return os.environ.get('MNPBEM_GPU_NATIVE', '1') != '0'
 
@@ -107,6 +111,7 @@ def _vram_share_active() -> bool:
     - ``MNPBEM_VRAM_SHARE_DISTRIBUTED=1``    (distributed-build gate, default '0')
     - ``MNPBEM_VRAM_SHARE_GPUS>=2``           (>=2 GPUs requested)
     - cupy is importable                      (device available at all)
+    - the requested devices are visible       (else one warning, no attempt)
 
     The DISTRIBUTED gate matches the pattern other solvers
     (bem_ret_iter, bem_ret_layer_iter, bem_ret_layer, bem_ret_mirror)
@@ -121,7 +126,7 @@ def _vram_share_active() -> bool:
     """
     if not _CUPY_OK_A2:
         return False
-    if os.environ.get('MNPBEM_GPU', '0') != '1':
+    if not _gpu_mod.use_gpu():
         return False
     if os.environ.get('MNPBEM_VRAM_SHARE', '0').strip() != '1':
         return False
@@ -134,7 +139,15 @@ def _vram_share_active() -> bool:
         n_gpus = int(raw)
     except ValueError:
         return False
-    return n_gpus >= 2
+    if n_gpus < 2:
+        return False
+    # device ids as parsed by _init_distributed_assemble
+    devs_raw = os.environ.get('MNPBEM_VRAM_SHARE_DEVICE_IDS', '').strip()
+    try:
+        device_ids = [int(x) for x in devs_raw.split(',') if x.strip()] if devs_raw else None
+    except ValueError:
+        device_ids = None
+    return _gpu_mod.vram_share_devices_visible(n_gpus, device_ids, 'BEMRet')
 
 
 class BEMRet(object):
@@ -309,8 +322,9 @@ class BEMRet(object):
         self : BEMRet
             Returns self for chaining
         """
-        # Skip if already initialized at this energy
-        if self.enei is not None and np.isclose(self.enei, enei):
+        # Skip if already initialized at this energy (exact test, as MATLAB
+        # initmat.m: obj.enei ~= enei)
+        if self.enei is not None and self.enei == enei:
             return self
 
         # Distributed multi-GPU build: when MNPBEM_VRAM_SHARE_GPUS>=2
@@ -383,7 +397,8 @@ class BEMRet(object):
         eps2_vals = self.p.eps2(enei)  # outside (nfaces,)
 
         # Check if all values are the same (can use scalar)
-        if np.allclose(eps1_vals, eps1_vals[0]) and np.allclose(eps2_vals, eps2_vals[0]):
+        # MATLAB: length(unique(diag(eps1))) == 1 (exact comparison)
+        if np.all(eps1_vals == eps1_vals[0]) and np.all(eps2_vals == eps2_vals[0]):
             self.eps1 = eps1_vals[0]
             self.eps2 = eps2_vals[0]
         else:
@@ -595,8 +610,8 @@ class BEMRet(object):
         # Dielectric scalars / arrays on host (cheap).
         eps1_vals = self.p.eps1(enei)
         eps2_vals = self.p.eps2(enei)
-        if np.allclose(eps1_vals, eps1_vals[0]) and np.allclose(
-                eps2_vals, eps2_vals[0]):
+        if np.all(eps1_vals == eps1_vals[0]) and np.all(
+                eps2_vals == eps2_vals[0]):
             self.eps1 = eps1_vals[0]
             self.eps2 = eps2_vals[0]
             scalar_eps = True
@@ -924,6 +939,7 @@ class BEMRet(object):
                   enei, _t_green, _t_lu, _t_sig, _t_tot), flush=True)
         return self
 
+    @keep_cuda_device
     def _init_distributed_assemble(self, enei):
         """Distributed multi-GPU BEM matrix assembly.
 
@@ -1022,8 +1038,8 @@ class BEMRet(object):
         # Dielectric scalars / arrays on host.
         eps1_vals = self.p.eps1(enei)
         eps2_vals = self.p.eps2(enei)
-        if (np.allclose(eps1_vals, eps1_vals[0])
-                and np.allclose(eps2_vals, eps2_vals[0])):
+        if (np.all(eps1_vals == eps1_vals[0])
+                and np.all(eps2_vals == eps2_vals[0])):
             self.eps1 = eps1_vals[0]
             self.eps2 = eps2_vals[0]
             scalar_eps = True
@@ -1243,6 +1259,7 @@ class BEMRet(object):
         # Move Delta to distributed tiles and factor.
         Delta_dm = DistributedMatrix.from_host(
             Delta_host, n_gpus=n_gpus, device_ids=device_ids)
+        del Delta_host  # the tiles hold Delta now; free the N x N host copy
         Delta_mglu = Delta_dm.lu_factor()
         Delta_mglu._distmat_keepalive = Delta_dm
         self.Delta_lu = ('mgpu', Delta_mglu, None)

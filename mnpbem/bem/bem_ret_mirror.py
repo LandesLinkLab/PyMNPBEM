@@ -7,8 +7,9 @@ from typing import Optional, List, Tuple, Any, Dict, Union
 from ..greenfun import CompStruct
 from ..greenfun.compgreen_ret_mirror import CompGreenRetMirror
 from ..geometry.comparticle_mirror import CompStructMirror
-from ..utils.gpu import lu_factor_dispatch, lu_solve_dispatch, to_host, is_cupy_array
+from ..utils.gpu import lu_factor_dispatch, lu_solve_dispatch, to_host, is_cupy_array, keep_cuda_device
 from .bem_ret import _vram_share_lu_kwargs
+from ..utils import gpu as _gpu_mod
 
 # cupy pool clean-up helpers mirroring bem_ret_layer.py
 try:
@@ -19,9 +20,16 @@ except Exception:
     _CUPY_OK_V173 = False
 
 
+def _cupy_calls_enabled() -> bool:
+    # The cupy pool / synchronize calls of this module open a CUDA context, so
+    # they (and the distributed build gated on this) run only on the GPU path:
+    # utils.gpu.use_gpu(), i.e. MNPBEM_GPU=1 (read per call) and a visible device.
+    return _CUPY_OK_V173 and _gpu_mod.use_gpu()
+
+
 def _free_cupy_pool() -> None:
     """deviceSynchronize + free_all_blocks (no-op when cupy unavailable)."""
-    if not _CUPY_OK_V173:
+    if not _cupy_calls_enabled():
         return
     try:
         _cp_v173.cuda.runtime.deviceSynchronize()
@@ -42,7 +50,7 @@ def _free_cupy_pool() -> None:
 
 
 def _vram_share_active() -> bool:
-    if not _CUPY_OK_V173:
+    if not _cupy_calls_enabled():
         return False
     if os.environ.get('MNPBEM_VRAM_SHARE', '0') != '1':
         return False
@@ -186,7 +194,7 @@ class BEMRetMirror(object):
 
         MATLAB: @bemretmirror/private/initmat.m
         """
-        if self.enei is not None and np.isclose(self.enei, enei):
+        if self.enei is not None and self.enei == enei:
             return self
 
         # Distributed-build path.
@@ -211,7 +219,7 @@ class BEMRetMirror(object):
                       '_Sigma1', '_Sigma2', '_Delta_lu', '_Sigma_lu'):
             if hasattr(self, _attr):
                 setattr(self, _attr, None)
-        if _CUPY_OK_V173:
+        if _cupy_calls_enabled():
             try:
                 _mempool_pre = _cp_v173.get_default_memory_pool()
                 _pinned_pre = _cp_v173.get_default_pinned_memory_pool()
@@ -239,7 +247,7 @@ class BEMRetMirror(object):
         eps1_vals = self.p.eps1(enei)
         eps2_vals = self.p.eps2(enei)
 
-        if np.allclose(eps1_vals, eps1_vals[0]) and np.allclose(eps2_vals, eps2_vals[0]):
+        if np.all(eps1_vals == eps1_vals[0]) and np.all(eps2_vals == eps2_vals[0]):
             self._eps1 = eps1_vals[0]
             self._eps2 = eps2_vals[0]
         else:
@@ -319,7 +327,7 @@ class BEMRetMirror(object):
         del G1_list, G1_cross, G2_list, G2_cross
         del H1_list, H1_cross, H2_list, H2_cross
         del G1, G2, H1, H2
-        if _CUPY_OK_V173:
+        if _cupy_calls_enabled():
             try:
                 _cp_v173.cuda.runtime.deviceSynchronize()
                 _cp_v173.get_default_memory_pool().free_all_blocks()
@@ -329,6 +337,7 @@ class BEMRetMirror(object):
 
         return self
 
+    @keep_cuda_device
     def _init_distributed_precond(self, enei: float) -> 'BEMRetMirror':
         """Distributed BEM build for the mirror-symmetry solver.
 
@@ -435,7 +444,7 @@ class BEMRetMirror(object):
 
         eps1_vals = self.p.eps1(enei)
         eps2_vals = self.p.eps2(enei)
-        if np.allclose(eps1_vals, eps1_vals[0]) and np.allclose(eps2_vals, eps2_vals[0]):
+        if np.all(eps1_vals == eps1_vals[0]) and np.all(eps2_vals == eps2_vals[0]):
             self._eps1 = eps1_vals[0]
             self._eps2 = eps2_vals[0]
         else:
@@ -486,7 +495,9 @@ class BEMRetMirror(object):
             self._G1_dm.append(G1_dm_i)
             # Inverse recovered once (host) so Sigma1 = H1 @ G1i matches
             # the legacy code path bit-for-bit on the GEMM ordering.
-            g1i = G1_lu_h.solve(np.eye(G1[i].shape[0], dtype=complex))
+            # Column-chunked: cusolverMgGetrs loses precision for about
+            # 2048 or more right-hand-side columns.
+            g1i = G1_lu_h.solve_chunked(np.eye(G1[i].shape[0], dtype=complex))
 
             # --------- Distributed LU of G2[i] -----------------------
             G2_dm_i = DistributedMatrix.from_host(
@@ -498,7 +509,7 @@ class BEMRetMirror(object):
             G2_lu_h = G2_dm_i.lu_factor(backend='cusolvermg')
             self._G2_lu.append(('mgpu', G2_lu_h, None))
             self._G2_dm.append(G2_dm_i)
-            g2i = G2_lu_h.solve(np.eye(G2[i].shape[0], dtype=complex))
+            g2i = G2_lu_h.solve_chunked(np.eye(G2[i].shape[0], dtype=complex))
 
             # L1 / L2 (con_cross_zero branch matches legacy)
             if con_cross_zero:

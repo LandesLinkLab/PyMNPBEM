@@ -13,7 +13,7 @@ Matches MATLAB MNPBEM implementation exactly.
 
 import numpy as np
 from ..greenfun import CompStruct
-from ..utils.gpu import _CUPY_OK, USE_GPU, _cp
+from ..utils.gpu import _CUPY_OK, use_gpu, _cp
 
 
 class PlaneWaveRet(object):
@@ -230,7 +230,7 @@ class PlaneWaveRet(object):
 
         # MATLAB: field.m lines 40-46
         if len(ind) > 0:
-            use_gpu_path = _CUPY_OK and USE_GPU
+            use_gpu_path = _CUPY_OK and use_gpu()
             if use_gpu_path:
                 pos_g = _cp.asarray(p.pos[ind, :])
                 dir_g = _cp.asarray(dir)
@@ -330,7 +330,7 @@ class PlaneWaveRet(object):
 
             # MATLAB: potential.m line 40-48
             if len(ind) > 0:
-                use_gpu_path = _CUPY_OK and USE_GPU
+                use_gpu_path = _CUPY_OK and use_gpu()
                 if use_gpu_path:
                     pos_g = _cp.asarray(p.pos[ind, :])
                     nvec_g = _cp.asarray(p.nvec[ind, :])

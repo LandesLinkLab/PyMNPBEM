@@ -77,6 +77,8 @@ from typing import Any, Callable, List, Optional, Tuple
 
 import numpy as np
 
+from .gpu import keep_cuda_device as _keep_device
+
 
 # ---------------------------------------------------------------------------
 # cupy import — required (this module is only used in the GPU path).
@@ -179,6 +181,7 @@ class DistributedMatrix(object):
         by ``from_func`` to skip the launch.
     """
 
+    @_keep_device
     def __init__(self,
             shape: Tuple[int, int],
             dtype: Any,
@@ -325,6 +328,7 @@ class DistributedMatrix(object):
     # ------------------------------------------------------------------
 
     @classmethod
+    @_keep_device
     def from_host(cls,
             A_host: np.ndarray,
             n_gpus: int,
@@ -360,6 +364,7 @@ class DistributedMatrix(object):
         return dm
 
     @classmethod
+    @_keep_device
     def from_func(cls,
             shape: Tuple[int, int],
             dtype: Any,
@@ -438,6 +443,7 @@ class DistributedMatrix(object):
     # Host gather
     # ------------------------------------------------------------------
 
+    @_keep_device
     def to_host(self) -> np.ndarray:
         """Gather all per-GPU tiles into a host numpy array."""
 
@@ -474,6 +480,7 @@ class DistributedMatrix(object):
         assert B.device_ids == self.device_ids, \
             '[error] device_ids mismatch'
 
+    @_keep_device
     def __add__(self, B: 'DistributedMatrix') -> 'DistributedMatrix':
         self._check_same_layout(B)
         out = DistributedMatrix(
@@ -488,6 +495,7 @@ class DistributedMatrix(object):
                 _cp.cuda.runtime.deviceSynchronize()
         return out
 
+    @_keep_device
     def __sub__(self, B: 'DistributedMatrix') -> 'DistributedMatrix':
         self._check_same_layout(B)
         out = DistributedMatrix(
@@ -502,6 +510,7 @@ class DistributedMatrix(object):
                 _cp.cuda.runtime.deviceSynchronize()
         return out
 
+    @_keep_device
     def iadd(self, B: 'DistributedMatrix') -> 'DistributedMatrix':
         """In-place add (modifies ``self``)."""
         self._check_same_layout(B)
@@ -512,6 +521,7 @@ class DistributedMatrix(object):
                 _cp.cuda.runtime.deviceSynchronize()
         return self
 
+    @_keep_device
     def isub(self, B: 'DistributedMatrix') -> 'DistributedMatrix':
         """In-place sub (modifies ``self``)."""
         self._check_same_layout(B)
@@ -526,6 +536,7 @@ class DistributedMatrix(object):
     # Distributed matmul
     # ------------------------------------------------------------------
 
+    @_keep_device
     def __matmul__(self, B: Any) -> 'DistributedMatrix':
         """Compute ``C = self @ B`` keeping the same distribution.
 
@@ -630,6 +641,7 @@ class DistributedMatrix(object):
     # LU integration with MultiGPULU
     # ------------------------------------------------------------------
 
+    @_keep_device
     def lu_factor(self,
             backend: str = 'cusolvermg') -> Any:
         """Factorize this matrix in place using cuSolverMg.
@@ -662,10 +674,13 @@ class DistributedMatrix(object):
             _cuda_set_device,
             _cuda_malloc,
             _cuda_device_sync,
+            _sync_devices,
+            _shared_handle_grid,
             _check_status,
             _cuda_dtype_for,
             _itemsize_for,
             cusolvermg_available,
+            CuSolverMgGetrfError,
             CUDA_C_64F,
             CUDA_R_64F,
             CUDA_C_32F,
@@ -703,27 +718,62 @@ class DistributedMatrix(object):
         lu.local_cols_alloc = self.local_cols_alloc
         lu.tile_cols_per_gpu = list(self._local_cols_active)
 
-        # Create cuSolverMg handle, grid, descriptor.
-        h = c_void_p(0)
-        _check_status(
-            _libcusolverMg.cusolverMgCreate(ctypes.byref(h)),
-            'cusolverMgCreate')
+        # The LU factors live in the DistributedMatrix's tiles. Override
+        # the LU handle's close() so it doesn't double-free our buffers
+        # (DistributedMatrix.free() owns them via cupy.ndarray refcount).
+        # We still need MultiGPULU.close() to release IPIV / workspace
+        # and the cuSolverMg objects, so we replace close() with a
+        # version that frees IPIV explicitly and skips array_d_A.
+        # Install it before the first cuSolverMg call: when getrf fails
+        # below, the discarded handle's close() must not cudaFree the
+        # cupy-owned tiles (cupy would free them again later).
+        @_keep_device
+        def _close_keep_A() -> None:
+            try:
+                # Sync first so any in-flight kernels don't trip the
+                # subsequent destroy calls.
+                for dev_id in lu.device_ids:
+                    try:
+                        _cuda_set_device(dev_id)
+                        _cuda_device_sync()
+                    except Exception:
+                        pass
+                # Free workspace.
+                if lu.array_d_work is not None:
+                    for g_idx, dev_id in enumerate(lu.device_ids):
+                        try:
+                            _cuda_set_device(dev_id)
+                            _libcudart.cudaFree(c_void_p(int(lu.array_d_work[g_idx] or 0)))
+                        except Exception:
+                            pass
+                    lu.array_d_work = None
+                # Free IPIV (we allocated it). Skip array_d_A.
+                if lu.array_d_IPIV is not None:
+                    for g_idx, dev_id in enumerate(lu.device_ids):
+                        try:
+                            _cuda_set_device(dev_id)
+                            _libcudart.cudaFree(c_void_p(int(lu.array_d_IPIV[g_idx] or 0)))
+                        except Exception:
+                            pass
+                    lu.array_d_IPIV = None
+                # Mark array_d_A as None so the parent destructor (if
+                # ever invoked) doesn't loop over it.
+                lu.array_d_A = None
+                # Tear down the descriptor; the handle and grid are shared
+                # (multi_gpu_lu._shared_handle_grid) and stay alive.
+                if lu.descr is not None:
+                    _libcusolverMg.cusolverMgDestroyMatrixDesc(lu.descr)
+                    lu.descr = None
+                lu.grid = None
+                lu.handle = None
+            except Exception:
+                pass
+
+        lu.close = _close_keep_A
+
+        # Shared cuSolverMg handle and grid, own descriptor.
+        h, grid = _shared_handle_grid(self.device_ids)
         lu.handle = h
-
-        dev_arr_c = (c_int * self.n_gpus)(*self.device_ids)
-        _check_status(
-            _libcusolverMg.cusolverMgDeviceSelect(
-                h, c_int(self.n_gpus), dev_arr_c),
-            'cusolverMgDeviceSelect')
-
-        grid = c_void_p(0)
-        dev_arr32 = (ctypes.c_int32 * self.n_gpus)(*self.device_ids)
-        _check_status(
-            _libcusolverMg.cusolverMgCreateDeviceGrid(
-                ctypes.byref(grid), ctypes.c_int32(1),
-                ctypes.c_int32(self.n_gpus),
-                dev_arr32, c_int(GRID_MAPPING_COL_MAJOR)),
-            'cusolverMgCreateDeviceGrid')
         lu.grid = grid
 
         descr = c_void_p(0)
@@ -761,6 +811,10 @@ class DistributedMatrix(object):
             ptrs_w[g] = c_void_p(_cuda_malloc(lu.work_lwork * itemsz))
         lu.array_d_work = ptrs_w
 
+        # cusolverMgGetrf does not wait for work still queued on the devices'
+        # default streams (e.g. an asynchronous write of the tiles), so
+        # synchronize every device first.
+        _sync_devices(self.device_ids)
         info = c_int(0)
         _check_status(
             _libcusolverMg.cusolverMgGetrf(
@@ -771,68 +825,15 @@ class DistributedMatrix(object):
                 ctypes.byref(info)),
             'cusolverMgGetrf')
         if info.value != 0:
-            raise RuntimeError(
-                '[error] cusolverMgGetrf reports info={} (singular or invalid)'
-                .format(info.value))
+            raise CuSolverMgGetrfError(info.value, N)
         _cuda_device_sync()
-
-        # The LU factors live in the DistributedMatrix's tiles. Override
-        # the LU handle's close() so it doesn't double-free our buffers
-        # (DistributedMatrix.free() owns them via cupy.ndarray refcount).
-        # We still need MultiGPULU.close() to release IPIV / workspace
-        # and the cuSolverMg objects, so we replace close() with a
-        # version that frees IPIV explicitly and skips array_d_A.
-        def _close_keep_A() -> None:
-            try:
-                # Sync first so any in-flight kernels don't trip the
-                # subsequent destroy calls.
-                for dev_id in lu.device_ids:
-                    try:
-                        _cuda_set_device(dev_id)
-                        _cuda_device_sync()
-                    except Exception:
-                        pass
-                # Free workspace.
-                if lu.array_d_work is not None:
-                    for g_idx, dev_id in enumerate(lu.device_ids):
-                        try:
-                            _cuda_set_device(dev_id)
-                            _libcudart.cudaFree(c_void_p(int(lu.array_d_work[g_idx] or 0)))
-                        except Exception:
-                            pass
-                    lu.array_d_work = None
-                # Free IPIV (we allocated it). Skip array_d_A.
-                if lu.array_d_IPIV is not None:
-                    for g_idx, dev_id in enumerate(lu.device_ids):
-                        try:
-                            _cuda_set_device(dev_id)
-                            _libcudart.cudaFree(c_void_p(int(lu.array_d_IPIV[g_idx] or 0)))
-                        except Exception:
-                            pass
-                    lu.array_d_IPIV = None
-                # Mark array_d_A as None so the parent destructor (if
-                # ever invoked) doesn't loop over it.
-                lu.array_d_A = None
-                # Tear down cuSolverMg objects.
-                if lu.descr is not None:
-                    _libcusolverMg.cusolverMgDestroyMatrixDesc(lu.descr)
-                    lu.descr = None
-                if lu.grid is not None:
-                    _libcusolverMg.cusolverMgDestroyGrid(lu.grid)
-                    lu.grid = None
-                if lu.handle is not None:
-                    _libcusolverMg.cusolverMgDestroy(lu.handle)
-                    lu.handle = None
-            except Exception:
-                pass
-
-        lu.close = _close_keep_A
         return lu
 
     # ------------------------------------------------------------------
     # Free
     # ------------------------------------------------------------------
 
+    @_keep_device
     def free(self) -> None:
         """Release all per-GPU buffers.
 

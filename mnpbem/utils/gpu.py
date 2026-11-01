@@ -21,15 +21,15 @@ device.
 from __future__ import annotations
 
 import os
+import functools
 import warnings
-from typing import Any, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 import numpy as np
 from scipy.linalg import lu_factor as _scipy_lu_factor
 from scipy.linalg import lu_solve as _scipy_lu_solve
 from scipy.linalg import solve as _scipy_solve
 
-USE_GPU: bool = os.environ.get("MNPBEM_GPU", "0") == "1"
 GPU_THRESHOLD: int = int(os.environ.get("MNPBEM_GPU_THRESHOLD", "1500"))
 
 try:
@@ -45,7 +45,7 @@ except Exception as _exc:
 
 
 def gpu_available() -> bool:
-    return _CUPY_OK and USE_GPU
+    return _CUPY_OK and use_gpu()
 
 
 def get_install_hint() -> str:
@@ -93,6 +93,116 @@ def has_gpu_capability(verbose: bool = False) -> bool:
     return True
 
 
+# MNPBEM_GPU=1 requests the GPU paths, but cupy also imports on a node without
+# a usable device (CPU-only node, CUDA_VISIBLE_DEVICES=''), and the first cupy
+# array then raises cudaErrorNoDevice (e.g. PlaneWaveRet.potential).  Treat
+# that like a missing cupy: warn once and keep every GPU-gated path on CPU.
+# The device check runs once per process, at the first use_gpu() call with
+# MNPBEM_GPU=1; without cupy the gates test _CUPY_OK themselves.
+_DEVICE_OK: Optional[bool] = None
+
+
+def _device_ok() -> bool:
+
+    global _DEVICE_OK
+
+    if _DEVICE_OK is None:
+        _DEVICE_OK = (not _CUPY_OK) or has_gpu_capability(verbose = True)
+
+    return _DEVICE_OK
+
+
+def use_gpu() -> bool:
+    # The GPU switch of every GPU gate in the package: MNPBEM_GPU=1 and a
+    # visible device.  MNPBEM_GPU is read at every call (one dictionary
+    # lookup), so setting it before or after `import mnpbem` both take effect.
+    return os.environ.get('MNPBEM_GPU', '0') == '1' and _device_ok()
+
+
+# Value at import, kept for code that reads the attribute.  The gates of the
+# package call use_gpu() instead.
+USE_GPU: bool = use_gpu()
+
+
+_VISIBLE_DEVICE_COUNT: Optional[int] = None
+
+
+def visible_device_count() -> int:
+    # Number of CUDA devices this process can use (0 without cupy or without a
+    # device); CUDA_VISIBLE_DEVICES is fixed for the process, so it is cached.
+    global _VISIBLE_DEVICE_COUNT
+
+    if _VISIBLE_DEVICE_COUNT is None:
+        try:
+            _VISIBLE_DEVICE_COUNT = int(_cp.cuda.runtime.getDeviceCount()) if _CUPY_OK else 0
+        except Exception:
+            _VISIBLE_DEVICE_COUNT = 0
+
+    return _VISIBLE_DEVICE_COUNT
+
+
+_DIST_DEVICES_WARNED: set = set()
+
+
+def vram_share_devices_visible(
+        n_gpus: int,
+        device_ids: Optional[List[int]],
+        solver: str) -> bool:
+
+    # Gate of the distributed multi-GPU builds (_vram_share_active): the
+    # requested devices (MNPBEM_VRAM_SHARE_DEVICE_IDS, else 0 .. n_gpus - 1)
+    # must be visible.  Otherwise the build is not attempted, instead of
+    # failing inside it and relying on the solver's exception fallback.
+    ids = list(device_ids) if device_ids else list(range(n_gpus))
+    n_visible = visible_device_count()
+
+    if n_gpus <= n_visible and all(0 <= d < n_visible for d in ids):
+        return True
+
+    key = (solver, n_gpus, tuple(ids), n_visible)
+    if key not in _DIST_DEVICES_WARNED:
+        _DIST_DEVICES_WARNED.add(key)
+        warnings.warn(
+            '[warn] {}: the distributed multi-GPU build needs {} GPUs (devices {}), but {} CUDA '
+            'device(s) are visible; the matrices are built without it.'.format(solver, n_gpus, ids, n_visible),
+            RuntimeWarning, stacklevel = 3)
+
+    return False
+
+
+_VRAM_SHARE_IGNORED_WARNED: bool = False
+
+
+def _warn_vram_share_ignored() -> None:
+
+    # MNPBEM_VRAM_SHARE* settings that select a multi-GPU path (all of them
+    # need MNPBEM_VRAM_SHARE_GPUS >= 2 and MNPBEM_VRAM_SHARE not 0) are
+    # ignored without the GPU path.  Say so once per process.
+    global _VRAM_SHARE_IGNORED_WARNED
+
+    if _VRAM_SHARE_IGNORED_WARNED:
+        return
+    if os.environ.get('MNPBEM_VRAM_SHARE', '1').strip() in ('0', 'false', 'False'):
+        return
+    try:
+        n_gpus = int(os.environ.get('MNPBEM_VRAM_SHARE_GPUS', '').strip())
+    except ValueError:
+        return
+    if n_gpus < 2:
+        return
+
+    _VRAM_SHARE_IGNORED_WARNED = True
+    names = ', '.join('{}={}'.format(k, os.environ[k]) for k in sorted(os.environ) if k.startswith('MNPBEM_VRAM_SHARE'))
+    if os.environ.get('MNPBEM_GPU', '0') != '1':
+        reason = 'MNPBEM_GPU={}'.format(os.environ.get('MNPBEM_GPU', '(unset)'))
+    else:
+        reason = 'no usable CUDA device'
+    warnings.warn(
+        '[warn] {} requests multi-GPU work, but the GPU path is off ({}); the MNPBEM_VRAM_SHARE '
+        'settings are ignored and no GPU is used.'.format(names, reason),
+        RuntimeWarning, stacklevel = 3)
+
+
 def require_gpu_or_raise() -> None:
     """Raise a friendly RuntimeError when MNPBEM_GPU=1 but cupy is missing.
 
@@ -100,7 +210,7 @@ def require_gpu_or_raise() -> None:
     embeds the install hint so the user does not need to look up extras
     separately.
     """
-    if not USE_GPU:
+    if not use_gpu():
         return
     if _CUPY_OK:
         return
@@ -120,7 +230,14 @@ def _vram_share_env_defaults() -> Tuple[Optional[int], Optional[str], Optional[l
     forces the helper off so callers can disable wiring without unsetting
     every variable. Backend default is ``'cusolvermg'``; ``device_ids``
     is parsed from a comma-separated list (e.g. '0,1,2,3').
+
+    Without the GPU path (``use_gpu()`` False: ``MNPBEM_GPU`` is not 1, or no
+    device is visible) the multi-GPU path is off as well (one warning when
+    these variables request it).
     """
+    if not use_gpu():
+        _warn_vram_share_ignored()
+        return None, None, None
     if os.environ.get('MNPBEM_VRAM_SHARE', '1').strip() in ('0', 'false', 'False'):
         return None, None, None
     raw = os.environ.get('MNPBEM_VRAM_SHARE_GPUS', '').strip()
@@ -142,6 +259,46 @@ def _vram_share_env_defaults() -> Tuple[Optional[int], Optional[str], Optional[l
     else:
         device_ids_env = None
     return n_gpus_env, backend_env, device_ids_env
+
+
+def _select_vram_share_device() -> None:
+    # With MNPBEM_VRAM_SHARE_DEVICE_IDS set, make its first id the current CUDA
+    # device before the first cupy call.  Otherwise single-device cupy work
+    # (plane-wave excitation, Green functions, solve) opens a context on
+    # device 0 even when device 0 is not in the list.  A device that is
+    # already current on this thread is kept.  Only with the GPU path on
+    # (use_gpu(), checked by _vram_share_env_defaults), so that MNPBEM_GPU=0
+    # opens no CUDA context.  Runs at import, i.e. for settings made before it.
+    _, _, device_ids = _vram_share_env_defaults()
+    if not _CUPY_OK or not device_ids:
+        return
+    try:
+        n_dev = int(_cp.cuda.runtime.getDeviceCount())
+    except Exception:
+        return  # no usable device; the multi-GPU paths fall back with their own warning
+    if not 0 < device_ids[0] < n_dev or _cp.cuda.driver.ctxGetCurrent() != 0:
+        return
+    _cp.cuda.runtime.setDevice(device_ids[0])
+
+
+_select_vram_share_device()
+
+
+def keep_cuda_device(fn: Callable) -> Callable:
+    # Decorator: restore the caller's current CUDA device when <fn> returns
+    # or raises.  The multi-GPU paths switch devices with cudaSetDevice and
+    # cupy allocates on the current device, so without the restore the
+    # caller's next cupy work runs on the last device of the device list.
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        if not _CUPY_OK:
+            return fn(*args, **kwargs)
+        dev = _cp.cuda.runtime.getDevice()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _cp.cuda.runtime.setDevice(dev)
+    return wrapper
 
 
 def lu_factor_dispatch(A: np.ndarray, **kwargs: Any) -> Tuple:
@@ -172,7 +329,8 @@ def lu_factor_dispatch(A: np.ndarray, **kwargs: Any) -> Tuple:
     n_gpus = int(kwargs.pop('n_gpus', env_n if env_n is not None else 1))
     backend = kwargs.pop('backend', env_backend if env_backend is not None else 'cusolvermg')
     device_ids = kwargs.pop('device_ids', env_devs)
-    if n_gpus >= 2:
+    if n_gpus >= 2 and use_gpu():
+        from .multi_gpu_lu import CuSolverMgGetrfError
         try:
             from .multi_gpu_lu import factor_multi_gpu, cusolvermg_available, warn_fallback
             if backend == 'cusolvermg' and not cusolvermg_available():
@@ -181,10 +339,17 @@ def lu_factor_dispatch(A: np.ndarray, **kwargs: Any) -> Tuple:
                 lu_handle = factor_multi_gpu(
                     A, n_gpus=n_gpus, backend=backend, device_ids=device_ids)
                 return ("mgpu", lu_handle, None)
+        except CuSolverMgGetrfError as exc:
+            warnings.warn(
+                '[warn] cuSolverMg LU failed: cusolverMgGetrf returned info={} for a '
+                '{} x {} matrix; falling back to the {} LU.'.format(
+                    exc.info, exc.n, exc.n,
+                    'single-GPU' if (_CUPY_OK and use_gpu() and A.shape[0] >= GPU_THRESHOLD) else 'CPU'),
+                RuntimeWarning, stacklevel=2)
         except (RuntimeError, NotImplementedError, ValueError) as exc:
             from .multi_gpu_lu import warn_fallback
             warn_fallback(repr(exc))
-    if _CUPY_OK and USE_GPU and A.shape[0] >= GPU_THRESHOLD:
+    if _CUPY_OK and use_gpu() and A.shape[0] >= GPU_THRESHOLD:
         A_gpu = _cp.asarray(A)
         lu_gpu, piv_gpu = _cp_lu_factor(A_gpu, overwrite_a=True)
         return ("gpu", lu_gpu, piv_gpu)
@@ -331,10 +496,12 @@ def solve_dispatch(A: np.ndarray, b: np.ndarray, **kwargs: Any) -> np.ndarray:
     """
     env_n, _, _ = _vram_share_env_defaults()
     has_mgpu_kw = ('n_gpus' in kwargs and int(kwargs['n_gpus']) >= 2)
-    if env_n is not None or has_mgpu_kw:
+    if use_gpu() and (env_n is not None or has_mgpu_kw):
         lu_pkg = lu_factor_dispatch(A, **kwargs)
         return lu_solve_dispatch(lu_pkg, b)
-    if _CUPY_OK and USE_GPU and A.shape[0] >= GPU_THRESHOLD:
+    for key in ('n_gpus', 'backend', 'device_ids'):
+        kwargs.pop(key, None)
+    if _CUPY_OK and use_gpu() and A.shape[0] >= GPU_THRESHOLD:
         A_gpu = _cp.asarray(A)
         b_gpu = _cp.asarray(b)
         x_gpu = _cp.linalg.solve(A_gpu, b_gpu)
@@ -386,7 +553,7 @@ def eigh_dispatch(A: np.ndarray,
     if k is not None and 0 < k < n - 1:
         # Strategy: prefer full GPU eigh + slice for moderate n;
         # scipy.sparse eigsh for very large CPU-only matrices.
-        if _CUPY_OK and USE_GPU and n >= GPU_THRESHOLD:
+        if _CUPY_OK and use_gpu() and n >= GPU_THRESHOLD:
             A_gpu = _cp.asarray(A)
             w_gpu, v_gpu = _cp.linalg.eigh(A_gpu)
             w = _cp.asnumpy(w_gpu)
@@ -441,7 +608,7 @@ def eigh_dispatch(A: np.ndarray,
                 pass
 
     # 2b. single-GPU cupy path
-    if _CUPY_OK and USE_GPU and n >= GPU_THRESHOLD:
+    if _CUPY_OK and use_gpu() and n >= GPU_THRESHOLD:
         A_gpu = _cp.asarray(A)
         w_gpu, v_gpu = _cp.linalg.eigh(A_gpu)
         return _cp.asnumpy(w_gpu), _cp.asnumpy(v_gpu)
@@ -522,7 +689,7 @@ def eig_dispatch(A: np.ndarray,
         return np.argsort(w.real)[:k_]
 
     # GPU full-eig path (single device)
-    if _CUPY_OK and USE_GPU and n >= GPU_THRESHOLD and not left:
+    if _CUPY_OK and use_gpu() and n >= GPU_THRESHOLD and not left:
         # cupy.linalg.eig: right eigenvectors only.
         try:
             A_gpu = _cp.asarray(A)
@@ -717,6 +884,7 @@ class MultiGPUEigh(object):
             return _CUDA_R_64F
         return _CUDA_R_32F
 
+    @keep_cuda_device
     def eigh(self, A: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Compute (w, v) of a Hermitian matrix A on multiple GPUs.
 
@@ -1101,7 +1269,7 @@ def matmul_dispatch(A: np.ndarray, B: np.ndarray, **kwargs: Any) -> np.ndarray:
     n_gpus = int(kwargs.pop('n_gpus', env_n if env_n is not None else 1))
     backend = kwargs.pop('backend', env_backend if env_backend is not None else 'cusolvermg')
     device_ids = kwargs.pop('device_ids', env_devs)
-    if n_gpus >= 2:
+    if n_gpus >= 2 and use_gpu():
         try:
             from .multi_gpu_lu import matmul_multi_gpu, warn_fallback
             # Backend note: cusolverMgGemm is undocumented (header
@@ -1114,7 +1282,7 @@ def matmul_dispatch(A: np.ndarray, B: np.ndarray, **kwargs: Any) -> np.ndarray:
         except (RuntimeError, NotImplementedError, ValueError) as exc:
             from .multi_gpu_lu import warn_fallback
             warn_fallback(repr(exc))
-    if _CUPY_OK and USE_GPU and A.shape[0] >= GPU_THRESHOLD:
+    if _CUPY_OK and use_gpu() and A.shape[0] >= GPU_THRESHOLD:
         A_gpu = _cp.asarray(A)
         B_gpu = _cp.asarray(B)
         C_gpu = A_gpu @ B_gpu
@@ -1133,14 +1301,15 @@ def matmul_dispatch(A: np.ndarray, B: np.ndarray, **kwargs: Any) -> np.ndarray:
 # independently of the layer-Green path.
 # ---------------------------------------------------------------------------
 
-LAYER_GPU: bool = (
-    USE_GPU and os.environ.get("MNPBEM_GPU_LAYER", "1").strip() not in ("", "0", "false", "False")
-)
+_LAYER_GPU_ENV: bool = os.environ.get("MNPBEM_GPU_LAYER", "1").strip() not in ("", "0", "false", "False")
+# Value at import, kept for code that reads the attribute; the helpers below
+# combine MNPBEM_GPU_LAYER with use_gpu() at each call.
+LAYER_GPU: bool = USE_GPU and _LAYER_GPU_ENV
 LAYER_GPU_THRESHOLD: int = int(os.environ.get("MNPBEM_GPU_LAYER_THRESHOLD", "5000"))
 
 
 def layer_gpu_available() -> bool:
-    return _CUPY_OK and LAYER_GPU
+    return _CUPY_OK and _LAYER_GPU_ENV and use_gpu()
 
 
 def layer_gpu_active(n_flat: int) -> bool:
@@ -1150,7 +1319,7 @@ def layer_gpu_active(n_flat: int) -> bool:
     copy and kernel launch overhead make GPU profitable only above a few
     thousand entries; below that NumPy wins.
     """
-    return _CUPY_OK and LAYER_GPU and n_flat >= LAYER_GPU_THRESHOLD
+    return _CUPY_OK and _LAYER_GPU_ENV and n_flat >= LAYER_GPU_THRESHOLD and use_gpu()
 
 
 def get_layer_xp(n_flat: int):

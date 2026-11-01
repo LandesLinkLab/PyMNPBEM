@@ -167,10 +167,10 @@ class ComPoint(object):
             points: List[Point],
             inout: Any) -> None:
         self.eps = eps
-        self.p = points
-        self.inout = np.atleast_1d(np.asarray(inout, dtype = int))
-        self._mask = list(range(len(self.p)))
-        self._npos = sum(pt.n for pt in self.p)
+        self._p_all = points
+        self._inout_all = np.atleast_1d(np.asarray(inout, dtype = int))
+        self._mask_ind = list(range(len(self._p_all)))
+        self._npos = sum(pt.n for pt in self._p_all)
         self._ind = None
         self._update_pc()
 
@@ -179,10 +179,10 @@ class ComPoint(object):
             pos_list: List[np.ndarray],
             inout: Any) -> None:
         self.eps = eps
-        self.p = [Point(pos) for pos in pos_list]
-        self.inout = np.atleast_1d(np.asarray(inout, dtype = int))
-        self._mask = list(range(len(self.p)))
-        self._npos = sum(pt.n for pt in self.p)
+        self._p_all = [Point(pos) for pos in pos_list]
+        self._inout_all = np.atleast_1d(np.asarray(inout, dtype = int))
+        self._mask_ind = list(range(len(self._p_all)))
+        self._npos = sum(pt.n for pt in self._p_all)
         self._ind = None
         self._update_pc()
 
@@ -244,20 +244,20 @@ class ComPoint(object):
                 inout_list.append(med)
                 ind_list.append(idx)
 
-        self.p = points
-        self.inout = np.array(inout_list, dtype = int) if len(inout_list) > 0 else np.array([], dtype = int)
+        self._p_all = points
+        self._inout_all = np.array(inout_list, dtype = int) if len(inout_list) > 0 else np.array([], dtype = int)
         self._ind = ind_list
 
         # Apply medium mask
         if medium is not None:
             if np.isscalar(medium):
                 medium = [medium]
-            self._mask = []
-            for i, io in enumerate(self.inout):
+            self._mask_ind = []
+            for i, io in enumerate(self._inout_all):
                 if io in medium:
-                    self._mask.append(i)
+                    self._mask_ind.append(i)
         else:
-            self._mask = list(range(len(self.p)))
+            self._mask_ind = list(range(len(self._p_all)))
 
         self._update_pc()
 
@@ -300,8 +300,46 @@ class ComPoint(object):
 
         return inout_per_point
 
+    # -- masked views (MATLAB @compound/subsref: obj.p( obj.mask ), obj.inout( obj.mask ))
+
+    def _is_unmasked(self) -> bool:
+        return self._mask_ind == list(range(len(self._p_all)))
+
+    @property
+    def p(self) -> List[Point]:
+        if self._is_unmasked():
+            return self._p_all
+        return [self._p_all[i] for i in self._mask_ind]
+
+    @p.setter
+    def p(self,
+            value: List[Point]) -> None:
+        self._p_all = value
+
+    @property
+    def inout(self) -> np.ndarray:
+        if self._is_unmasked():
+            return self._inout_all
+        return self._inout_all[self._mask_ind]
+
+    @inout.setter
+    def inout(self,
+            value: np.ndarray) -> None:
+        self._inout_all = value
+
+    @property
+    def _mask(self) -> List[int]:
+        # Index into the masked views p / inout (see ComParticle._mask)
+        return list(range(len(self._mask_ind)))
+
+    @_mask.setter
+    def _mask(self,
+            value: List[int]) -> None:
+        # assignment as before: indices into all point groups
+        self._mask_ind = list(value)
+
     def _update_pc(self) -> None:
-        active = [self.p[i] for i in self._mask]
+        active = self.p
         if len(active) == 0:
             self._pc = Point(np.zeros((0, 3)))
         elif len(active) == 1:
@@ -338,22 +376,22 @@ class ComPoint(object):
     def index(self) -> List[np.ndarray]:
         idx_list = []
         offset = 0
-        for i in self._mask:
-            npts = self.p[i].n
+        for pt in self.p:
+            npts = pt.n
             idx_list.append(np.arange(offset, offset + npts, dtype = int))
             offset += npts
         return idx_list
 
     @property
     def np(self) -> int:
-        return len(self._mask)
+        return len(self._mask_ind)
 
     def eps1(self,
             enei: float) -> np.ndarray:
         eps_vals = np.zeros(self.n, dtype = complex)
         offset = 0
-        for i in self._mask:
-            npts = self.p[i].n
+        for i, pt in enumerate(self.p):
+            npts = pt.n
             eps_idx = int(self.inout[i]) - 1  # 1-indexed to 0-indexed
             eps_func = self.eps[eps_idx]
             result = eps_func(enei)
@@ -405,7 +443,7 @@ class ComPoint(object):
         for d in direction:
             # d is 1-indexed (1=x, 2=y, 3=z) following MATLAB convention
             col = d - 1
-            for pt in obj.p:
+            for pt in obj._p_all:
                 pt.pos[:, col] = -pt.pos[:, col]
         obj._update_pc()
         return obj
@@ -423,8 +461,8 @@ class ComPoint(object):
             # Build global-to-group mapping
             ipt = []
             local_idx = []
-            for i in range(len(obj.p)):
-                for j in range(obj.p[i].n):
+            for i in range(len(obj._p_all)):
+                for j in range(obj._p_all[i].n):
                     ipt.append(i)
                     local_idx.append(j)
             ipt = np.array(ipt)
@@ -433,12 +471,12 @@ class ComPoint(object):
             sel_ipt = ipt[idx]
             sel_local = local_idx[idx]
 
-            for i in range(len(obj.p)):
+            for i in range(len(obj._p_all)):
                 mask = sel_ipt == i
                 if np.any(mask):
-                    obj.p[i] = obj.p[i].select(index = sel_local[mask])
+                    obj._p_all[i] = obj._p_all[i].select(index = sel_local[mask])
                 else:
-                    obj.p[i] = Point(np.zeros((0, 3)))
+                    obj._p_all[i] = Point(np.zeros((0, 3)))
         else:
             kwargs = {}
             if carfun is not None:
@@ -447,13 +485,13 @@ class ComPoint(object):
                 kwargs['polfun'] = polfun
             elif sphfun is not None:
                 kwargs['sphfun'] = sphfun
-            obj.p = [pt.select(**kwargs) for pt in obj.p]
+            obj._p_all = [pt.select(**kwargs) for pt in obj._p_all]
 
         # Remove empty groups
-        nonempty = [i for i, pt in enumerate(obj.p) if pt.n > 0]
-        obj.p = [obj.p[i] for i in nonempty]
-        obj.inout = obj.inout[nonempty] if len(nonempty) > 0 else np.array([], dtype = int)
-        obj._mask = list(range(len(obj.p)))
+        nonempty = [i for i, pt in enumerate(obj._p_all) if pt.n > 0]
+        obj._p_all = [obj._p_all[i] for i in nonempty]
+        obj._inout_all = obj._inout_all[nonempty] if len(nonempty) > 0 else np.array([], dtype = int)
+        obj._mask_ind = list(range(len(obj._p_all)))
         obj._update_pc()
         return obj
 
@@ -468,8 +506,8 @@ class ComPoint(object):
             val = np.full((self._npos,) + siz[1:], valdef, dtype=dtype)
 
         offset = 0
-        for i in self._mask:
-            npts = self.p[i].n
+        for i in self._mask_ind:
+            npts = self._p_all[i].n
             if self._ind is not None:
                 orig_idx = self._ind[i]
             else:
@@ -480,4 +518,4 @@ class ComPoint(object):
         return val
 
     def __repr__(self) -> str:
-        return 'ComPoint(n={}, groups={})'.format(self.n, len(self._mask))
+        return 'ComPoint(n={}, groups={})'.format(self.n, len(self._mask_ind))

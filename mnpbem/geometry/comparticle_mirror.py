@@ -151,10 +151,12 @@ class ComParticleMirror(object):
                 "ComParticleMirror: 'sym' must be one of 'x', 'y', 'xy'; got {!r}.".format(sym))
 
         self.eps = eps
-        self.p = list(particles)
-        self.inout = np.atleast_2d(inout)
+        # all particles and inout rows; p and inout return the masked ones
+        # (MATLAB @compound/subsref)
+        self._p_all = list(particles)
+        self._inout_all = np.atleast_2d(inout)
         self.sym = sym
-        self._mask = list(range(len(self.p)))
+        self._mask_ind = list(range(len(self._p_all)))
 
         # symmetry table
         self._init_symtable()
@@ -185,8 +187,8 @@ class ComParticleMirror(object):
         """
         mirror_map = {'x': 0, 'y': 1, 'xy': None}
 
-        p_list = list(self.p)
-        inout_list = self.inout.tolist()
+        p_list = list(self._p_all)
+        inout_list = self._inout_all.tolist()
 
         # mirror in x direction
         if self.sym in ('x', 'xy'):
@@ -211,13 +213,13 @@ class ComParticleMirror(object):
         MATLAB: @comparticlemirror/closed.m
         """
         n_sym_cols = self.symtable.shape[1]
-        n_full = len(self.pfull.p)
+        n_full = len(self.pfull._p_all)
         # MATLAB reshape is column-major, so use Fortran order here so that
         # particle k's mirror copies occupy row k-1 of `ind`.
         ind = np.arange(1, n_full + 1).reshape(-1, n_sym_cols, order='F')
 
-        if self.pfull.closed is None:
-            self.pfull.closed = [None] * n_full
+        # closed is a class variable of the full particle (all particles)
+        closed = self.pfull._closed_all
 
         for arg in args:
             if not isinstance(arg, (list, tuple)) or not isinstance(arg[0], (list, Particle)):
@@ -236,20 +238,25 @@ class ComParticleMirror(object):
 
                 tab = np.array(tab_rows).ravel()
                 for j in tab:
-                    self.pfull.closed[abs(j) - 1] = tab.tolist()
+                    closed[abs(j) - 1] = tab.tolist()
             else:
-                idx = arg[0]
+                # MATLAB { i1, p1, p2, ... }: index (scalar or [i1], as in
+                # ComParticle.set_closed) followed by additional particles
+                idx = arg[0] if np.isscalar(arg[0]) else arg[0][0]
                 tab = ind[idx - 1, :].ravel()
                 particles_to_concat = []
                 for t in tab:
-                    particles_to_concat.append(self.pfull.p[t - 1])
+                    particles_to_concat.append(self.pfull._p_all[t - 1])
                 for extra_p in arg[1:]:
                     particles_to_concat.append(extra_p)
                 combined = particles_to_concat[0]
                 for pp in particles_to_concat[1:]:
                     combined = combined + pp
-                for j in range(len(tab)):
-                    self.pfull.closed[j] = combined
+                # MATLAB closed.m assigns obj.pfull.closed{ j } for j = 1 : length( tab ),
+                # i.e. to the first particles of pfull; the closed particle belongs to
+                # particle idx and its mirror copies, the entries of tab
+                for j in tab:
+                    closed[j - 1] = combined
 
     def full(self) -> ComParticle:
         """Return full particle produced with mirror symmetry.
@@ -335,15 +342,56 @@ class ComParticleMirror(object):
 
         MATLAB: mask(obj, ind)
         """
+        if ind is None or np.size(ind) == 0:
+            ind = range(1, len(self._p_all) + 1)
         if np.isscalar(ind):
             ind = [ind]
-        self._mask = [i - 1 for i in ind]
+        self._mask_ind = [int(i) - 1 for i in ind]
 
         # also mask the full particle
-        ip = np.arange(1, len(self.pfull.p) + 1).reshape(len(self.p), -1)
-        full_ind = ip[np.array([i - 1 for i in ind]), :].ravel()
+        # MATLAB: ip = reshape( 1 : length( obj.pfull.p ), length( obj.p ), [] );
+        #         obj.pfull = mask( obj.pfull, reshape( ip( ind, : ), 1, [] ) );
+        # (column-major: row k holds particle k and its mirror copies)
+        ip = np.arange(1, len(self.pfull._p_all) + 1).reshape(len(self._p_all), -1, order = 'F')
+        full_ind = ip[np.array(self._mask_ind), :].ravel(order = 'F')
         self.pfull.set_mask(full_ind.tolist())
         return self
+
+    def _is_unmasked(self) -> bool:
+        return self._mask_ind == list(range(len(self._p_all)))
+
+    @property
+    def p(self) -> List[Particle]:
+        if self._is_unmasked():
+            return self._p_all
+        return [self._p_all[i] for i in self._mask_ind]
+
+    @p.setter
+    def p(self,
+            value: List[Particle]) -> None:
+        self._p_all = value
+
+    @property
+    def inout(self) -> np.ndarray:
+        if self._is_unmasked():
+            return self._inout_all
+        return self._inout_all[self._mask_ind, :]
+
+    @inout.setter
+    def inout(self,
+            value: np.ndarray) -> None:
+        self._inout_all = value
+
+    @property
+    def _mask(self) -> List[int]:
+        # Index into the masked views p / inout (see ComParticle._mask)
+        return list(range(len(self._mask_ind)))
+
+    @_mask.setter
+    def _mask(self,
+            value: List[int]) -> None:
+        # assignment as before: indices into all particles
+        self._mask_ind = list(value)
 
     # delegate properties to underlying comparticle
     @property
@@ -377,8 +425,8 @@ class ComParticleMirror(object):
 
     @property
     def mask(self) -> np.ndarray:
-        mask_arr = np.zeros(len(self.p), dtype = bool)
-        for i in self._mask:
+        mask_arr = np.zeros(len(self._p_all), dtype = bool)
+        for i in self._mask_ind:
             mask_arr[i] = True
         return mask_arr
 

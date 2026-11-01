@@ -30,7 +30,9 @@ except ImportError:
 
 try:
     import cupy as _cp  # type: ignore
-    CUPY_AVAILABLE = True
+    # cupy also imports without a visible device (CPU node, CUDA_VISIBLE_DEVICES=);
+    # getDeviceCount() raises then, as in bem_stat_iter.py and utils/gpu.py
+    CUPY_AVAILABLE = _cp.cuda.runtime.getDeviceCount() > 0
 except Exception:
     _cp = None  # type: ignore
     CUPY_AVAILABLE = False

@@ -568,7 +568,8 @@ class CompGreenRetLayer(object):
         # Direct (free-space) Green function
         self.g = CompGreenRet(p1, p2, **options)
 
-        # Reflected Green function
+        # Reflected Green function; deriv is passed explicitly below
+        options.pop('deriv', None)
         tab = options.pop('tab', None)
         greentab_obj = options.pop('greentab_obj', None)
         if greentab_obj is not None:

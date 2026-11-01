@@ -11,10 +11,11 @@ from scipy.sparse.linalg import LinearOperator
 from ..greenfun import CompStruct
 from ..utils.gpu import (
     lu_factor_dispatch, lu_solve_dispatch, matmul_dispatch,
-    to_host, is_cupy_array,
+    to_host, is_cupy_array, _vram_share_env_defaults, vram_share_devices_visible,
 )
 from ..utils.matlab_compat import msqrt
 from .bem_iter import BEMIter
+from .bem_ret_iter import _interp_deriv
 
 # GPU memory-pool cleanup: mirror BEMRet's wavelength-end immediate
 # free pattern so cupy returns blocks to the driver at every wavelength
@@ -32,6 +33,16 @@ try:
 except Exception:
     _cp_layer = None  # type: ignore
     _CUPY_OK_LAYER = False
+
+
+def _layer_pool_calls_enabled() -> bool:
+    # The cupy pool / stream calls below create a CUDA context on first use, so
+    # run them only when this module can hold device memory: with MNPBEM_GPU=1,
+    # or when lu_factor_dispatch / matmul_dispatch use several GPUs, which they
+    # do from MNPBEM_VRAM_SHARE_GPUS>=2 alone (utils/gpu.py).
+    if not _CUPY_OK_LAYER:
+        return False
+    return os.environ.get('MNPBEM_GPU', '0') == '1' or _vram_share_env_defaults()[0] is not None
 
 
 def _vram_share_lu_kwargs() -> dict:
@@ -68,7 +79,7 @@ def _gpu_pool_cleanup_layer(apply_limit: bool = False) -> None:
     Honours MNPBEM_GPU_POOL_LIMIT_GB (legitimate peaks past this cap will
     OOM; default 0 = uncapped).
     """
-    if not _CUPY_OK_LAYER:
+    if not _layer_pool_calls_enabled():
         return
     try:
         mempool = _cp_layer.get_default_memory_pool()
@@ -117,8 +128,10 @@ def _vram_share_active() -> bool:
 
     Mirrors BEMRetIter helper; activated by
     ``MNPBEM_VRAM_SHARE_DISTRIBUTED=1`` plus the usual VRAM-share env
-    config (``MNPBEM_VRAM_SHARE=1`` + ``MNPBEM_VRAM_SHARE_GPUS>=2``)
-    and cupy/cuSolverMg availability.
+    config (``MNPBEM_VRAM_SHARE=1`` + ``MNPBEM_VRAM_SHARE_GPUS>=2``),
+    ``MNPBEM_GPU=1`` (as in ``bem_ret._vram_share_active``),
+    cupy/cuSolverMg availability and visible requested devices (else one
+    warning, no attempt).
 
     For BEMRetLayerIter the win is larger than the dense BEMRet path:
     the layered Green's function exposes a 5-block ``(ss, hh, p, sh, hs)``
@@ -130,6 +143,8 @@ def _vram_share_active() -> bool:
     _LayerGreen does its own per-block work that does not yet have an
     eval_block analogue).
     """
+    if os.environ.get('MNPBEM_GPU', '0') != '1':
+        return False
     if os.environ.get('MNPBEM_VRAM_SHARE', '0') != '1':
         return False
     if os.environ.get('MNPBEM_VRAM_SHARE_DISTRIBUTED', '0') != '1':
@@ -144,9 +159,12 @@ def _vram_share_active() -> bool:
         return False
     try:
         from ..utils.multi_gpu_lu import cusolvermg_available
-        return bool(cusolvermg_available())
+        if not cusolvermg_available():
+            return False
     except Exception:
         return False
+    n_gpus, _, device_ids = _vram_share_env_config()
+    return vram_share_devices_visible(n_gpus, device_ids, 'BEMRetLayerIter')
 
 
 def _vram_share_env_config() -> Tuple[int, str, Optional[List[int]]]:
@@ -324,7 +342,7 @@ class BEMRetLayerIter(BEMIter):
         # Belt-and-braces inline drain (matches bem_ret.py:501-503 pattern)
         # in case the helper short-circuited because cupy isn't importable
         # on this build.  Guarded so CPU path is bit-identical.
-        if _CUPY_OK_LAYER:
+        if _layer_pool_calls_enabled():
             _cp_layer.cuda.runtime.deviceSynchronize()
             _cp_layer.get_default_memory_pool().free_all_blocks()
             _cp_layer.get_default_pinned_memory_pool().free_all_blocks()
@@ -375,26 +393,26 @@ class BEMRetLayerIter(BEMIter):
             # a search.  An explicit drain after each Green-function stage keeps
             # the high-water mark stable across the four eval() calls below.
             del G11, G21
-            if _CUPY_OK_LAYER:
+            if _layer_pool_calls_enabled():
                 _cp_layer.get_default_memory_pool().free_all_blocks()
 
             H11 = _coerce_host(self.g.eval(0, 0, 'H1', enei))
             H21 = _coerce_host(self.g.eval(1, 0, 'H1', enei))
             H1 = H11 - H21 if not (isinstance(H21, (int, float)) and H21 == 0) else H11
             del H11, H21
-            if _CUPY_OK_LAYER:
+            if _layer_pool_calls_enabled():
                 _cp_layer.get_default_memory_pool().free_all_blocks()
 
         # Green functions for outer surfaces (with layer structure)
         # MATLAB: G2 = g{2,2}.G(enei); g2 = g{1,2}.G(enei)
         G22_full = _coerce_host(self.g.eval(1, 1, 'G', enei))
         g2 = _coerce_host(self.g.eval(0, 1, 'G', enei))
-        if _CUPY_OK_LAYER:
+        if _layer_pool_calls_enabled():
             _cp_layer.get_default_memory_pool().free_all_blocks()
 
         H22_full = _coerce_host(self.g.eval(1, 1, 'H2', enei))
         h2 = _coerce_host(self.g.eval(0, 1, 'H2', enei))
-        if _CUPY_OK_LAYER:
+        if _layer_pool_calls_enabled():
             _cp_layer.get_default_memory_pool().free_all_blocks()
 
         # For layer structure, G2 is a dict-like with ss, hh, p, sh, hs components
@@ -449,7 +467,7 @@ class BEMRetLayerIter(BEMIter):
         # directly (rather than via locals()) is the only safe way to drop
         # function-frame bindings in CPython.
         del G1, H1, G2, H2, G22_full, g2, H22_full, h2
-        if _CUPY_OK_LAYER:
+        if _layer_pool_calls_enabled():
             _cp_layer.cuda.runtime.deviceSynchronize()
             _cp_layer.get_default_memory_pool().free_all_blocks()
         _gpu_pool_cleanup_layer()
@@ -461,7 +479,7 @@ class BEMRetLayerIter(BEMIter):
             # 12672-face dimers on a substrate) and a block-2x2 Schur
             # complement.  Drain right after init so the GMRES Krylov build
             # below sees the maximum amount of free device memory.
-            if _CUPY_OK_LAYER:
+            if _layer_pool_calls_enabled():
                 _cp_layer.cuda.runtime.deviceSynchronize()
                 _cp_layer.get_default_memory_pool().free_all_blocks()
                 _cp_layer.get_default_pinned_memory_pool().free_all_blocks()
@@ -516,7 +534,7 @@ class BEMRetLayerIter(BEMIter):
                 n_gpus = n_gpus, device_ids = device_ids)
         G1_host = dm_G1.to_host()
         dm_G1.free()
-        if _CUPY_OK_LAYER:
+        if _layer_pool_calls_enabled():
             _cp_layer.get_default_memory_pool().free_all_blocks()
 
         dm_H1 = _distributed_block_assemble_layer(
@@ -526,7 +544,7 @@ class BEMRetLayerIter(BEMIter):
                 n_gpus = n_gpus, device_ids = device_ids)
         H1_host = dm_H1.to_host()
         dm_H1.free()
-        if _CUPY_OK_LAYER:
+        if _layer_pool_calls_enabled():
             _cp_layer.cuda.runtime.deviceSynchronize()
             _cp_layer.get_default_memory_pool().free_all_blocks()
             _cp_layer.get_default_pinned_memory_pool().free_all_blocks()
@@ -619,14 +637,14 @@ class BEMRetLayerIter(BEMIter):
         # Bit-identical to the single-GPU path when the env vars are off.
         _vram_kwargs = _vram_share_lu_kwargs()
         G1_lu = lu_factor_dispatch(G1, **_vram_kwargs)
-        if _CUPY_OK_LAYER:
+        if _layer_pool_calls_enabled():
             _cp_layer.get_default_memory_pool().free_all_blocks()
         G2p_lu = lu_factor_dispatch(G2_p, **_vram_kwargs)
-        if _CUPY_OK_LAYER:
+        if _layer_pool_calls_enabled():
             _cp_layer.get_default_memory_pool().free_all_blocks()
         G1i = lu_solve_dispatch(G1_lu, np.eye(G1.shape[0]))
         G2pi = lu_solve_dispatch(G2p_lu, np.eye(G2_p.shape[0]))
-        if _CUPY_OK_LAYER:
+        if _layer_pool_calls_enabled():
             _cp_layer.get_default_memory_pool().free_all_blocks()
 
         # Sigma matrices [Eq. (21)]
@@ -648,10 +666,10 @@ class BEMRetLayerIter(BEMIter):
 
         # Gamma matrix
         Gamma_lu = lu_factor_dispatch(Sigma1 - Sigma2p, **_vram_kwargs)
-        if _CUPY_OK_LAYER:
+        if _layer_pool_calls_enabled():
             _cp_layer.get_default_memory_pool().free_all_blocks()
         Gamma = lu_solve_dispatch(Gamma_lu, np.eye(Sigma1.shape[0]))
-        if _CUPY_OK_LAYER:
+        if _layer_pool_calls_enabled():
             _cp_layer.get_default_memory_pool().free_all_blocks()
 
         # Gammapar with only parallel normal vector components
@@ -693,19 +711,19 @@ class BEMRetLayerIter(BEMIter):
         # LU decomposition as block inverse
         # L11 * U11 = M11
         m11_lu = lu_factor_dispatch(m11, **_vram_kwargs)
-        if _CUPY_OK_LAYER:
+        if _layer_pool_calls_enabled():
             _cp_layer.get_default_memory_pool().free_all_blocks()
         im11 = lu_solve_dispatch(m11_lu, np.eye(m11.shape[0]))
         # L11 * U12 = M12 -> U12 = inv(L11) * M12
         im12 = matmul_dispatch(im11, m12)
         # L21 * U11 = M21 -> L21 = M21 * inv(U11)
         im21 = matmul_dispatch(m21, im11)
-        if _CUPY_OK_LAYER:
+        if _layer_pool_calls_enabled():
             _cp_layer.get_default_memory_pool().free_all_blocks()
         # L22 * U22 = M22 - L21 * U12
         schur = m22 - matmul_dispatch(im21, m12)
         schur_lu = lu_factor_dispatch(schur, **_vram_kwargs)
-        if _CUPY_OK_LAYER:
+        if _layer_pool_calls_enabled():
             _cp_layer.get_default_memory_pool().free_all_blocks()
         im22 = lu_solve_dispatch(schur_lu, np.eye(schur.shape[0]))
         # Drop the dense m11/m12/m21/m22/schur buffers; only their LU
@@ -713,7 +731,7 @@ class BEMRetLayerIter(BEMIter):
         # ``_mfun``.  Each m-block is N x N complex128 (~2.5 GB at
         # N=12672) so this is a load-bearing release.
         del m11, m12, m21, m22, schur
-        if _CUPY_OK_LAYER:
+        if _layer_pool_calls_enabled():
             _cp_layer.cuda.runtime.deviceSynchronize()
             _cp_layer.get_default_memory_pool().free_all_blocks()
 
@@ -1293,7 +1311,7 @@ class BEMRetLayerIter(BEMIter):
         # buffers in the pool; releasing them now keeps the per-iter
         # matvec / preconditioner-apply allocations from triggering a
         # fragmentation-induced OOM mid-sweep.
-        if _CUPY_OK_LAYER:
+        if _layer_pool_calls_enabled():
             _cp_layer.cuda.runtime.deviceSynchronize()
             _cp_layer.get_default_memory_pool().free_all_blocks()
         _gpu_pool_cleanup_layer()
@@ -1307,7 +1325,7 @@ class BEMRetLayerIter(BEMIter):
         # we just want to compact the pool before the next wavelength's
         # init drains the prior state.
         del fa, fm
-        if _CUPY_OK_LAYER:
+        if _layer_pool_calls_enabled():
             _cp_layer.cuda.runtime.deviceSynchronize()
             _cp_layer.get_default_memory_pool().free_all_blocks()
         _gpu_pool_cleanup_layer()
@@ -1341,7 +1359,7 @@ class BEMRetLayerIter(BEMIter):
         # solve-exit cleanup: drain any residual transient buffers
         # before returning so the caller's wavelength loop sees a fully
         # drained pool when it advances to the next enei.
-        if _CUPY_OK_LAYER:
+        if _layer_pool_calls_enabled():
             _cp_layer.get_default_memory_pool().free_all_blocks()
             _cp_layer.get_default_pinned_memory_pool().free_all_blocks()
         _gpu_pool_cleanup_layer()
@@ -1385,8 +1403,8 @@ class BEMRetLayerIter(BEMIter):
             phi, phip, a, ap = pot.phi2, pot.phi2p, pot.a2, pot.a2p
 
         # Tangential directions via interpolation
-        phi1_d, phi2_d = self.p.deriv(self.p.interp(phi))[:2]
-        a1_d, a2_d, t1, t2 = self.p.deriv(self.p.interp(a))
+        phi1_d, phi2_d = _interp_deriv(self.p, phi)[:2]
+        a1_d, a2_d, t1, t2 = _interp_deriv(self.p, a)
 
         # Normal vector
         nvec = np.cross(t1, t2)
@@ -1442,7 +1460,7 @@ class BEMRetLayerIter(BEMIter):
         # explicit clear() means the user wants the device drained.
         # Without this the LU factors / G blocks just released above stay
         # in the cupy pool until the next solve triggers a free_all_blocks.
-        if _CUPY_OK_LAYER:
+        if _layer_pool_calls_enabled():
             _cp_layer.cuda.runtime.deviceSynchronize()
             _cp_layer.get_default_memory_pool().free_all_blocks()
             _cp_layer.get_default_pinned_memory_pool().free_all_blocks()

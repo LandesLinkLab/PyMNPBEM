@@ -287,19 +287,25 @@ class GreenTabLayer(object):
                 self._Frsav_comp[name] = self._Frsav_multi[name][:, :, :, 0]
                 self._Fzsav_comp[name] = self._Fzsav_multi[name][:, :, :, 0]
         else:
-            idx = np.searchsorted(enei_arr, enei, side='right') - 1
+            # MATLAB interp1 accepts the tabulated wavelengths in any order;
+            # searchsorted needs them ascending, so search a sorted copy and map
+            # the two bracketing entries back to their table columns
+            order = np.argsort(enei_arr, kind = 'stable')
+            enei_sorted = enei_arr[order]
+            idx = np.searchsorted(enei_sorted, enei, side='right') - 1
             idx = np.clip(idx, 0, len(enei_arr) - 2)
 
             # A single-wavelength run can be tabulated at two coincident
             # wavelengths; the zero span then divides through and quietly turns
             # the whole table -- and every field built from it -- into NaN.
             # Coincident endpoints hold the same data, so either one will do.
-            span = enei_arr[idx + 1] - enei_arr[idx]
-            frac = 0.0 if span == 0 else (enei - enei_arr[idx]) / span
+            span = enei_sorted[idx + 1] - enei_sorted[idx]
+            frac = 0.0 if span == 0 else (enei - enei_sorted[idx]) / span
+            i0, i1 = order[idx], order[idx + 1]
             for name in names:
-                self._Gsav_comp[name] = (1 - frac) * self._Gsav_multi[name][:, :, :, idx] + frac * self._Gsav_multi[name][:, :, :, idx + 1]
-                self._Frsav_comp[name] = (1 - frac) * self._Frsav_multi[name][:, :, :, idx] + frac * self._Frsav_multi[name][:, :, :, idx + 1]
-                self._Fzsav_comp[name] = (1 - frac) * self._Fzsav_multi[name][:, :, :, idx] + frac * self._Fzsav_multi[name][:, :, :, idx + 1]
+                self._Gsav_comp[name] = (1 - frac) * self._Gsav_multi[name][:, :, :, i0] + frac * self._Gsav_multi[name][:, :, :, i1]
+                self._Frsav_comp[name] = (1 - frac) * self._Frsav_multi[name][:, :, :, i0] + frac * self._Frsav_multi[name][:, :, :, i1]
+                self._Fzsav_comp[name] = (1 - frac) * self._Fzsav_multi[name][:, :, :, i0] + frac * self._Fzsav_multi[name][:, :, :, i1]
 
         self._enei_comp = enei
 
@@ -370,10 +376,10 @@ class GreenTabLayer(object):
         """Ensure per-component table is computed/interpolated for this enei."""
         if hasattr(self, '_Gsav_multi') and self._Gsav_multi is not None:
             # Multi-wavelength path
-            if self._enei_comp is None or not np.isclose(self._enei_comp, enei):
+            if self._enei_comp is None or self._enei_comp != enei:
                 self._interp_wavelength(enei)
         elif self._Gsav_comp is None or (
-                self._enei_comp is not None and not np.isclose(self._enei_comp, enei)):
+                self._enei_comp is not None and self._enei_comp != enei):
             self._compute_tab(enei)
 
     def _interp_components(self,

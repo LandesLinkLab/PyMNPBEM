@@ -10,7 +10,7 @@ import os
 
 import numpy as np
 
-from ..utils.gpu import _CUPY_OK, USE_GPU, _cp
+from ..utils.gpu import _CUPY_OK, use_gpu, _cp
 
 
 def _load_pinfty_default():
@@ -300,7 +300,7 @@ def _farfield(self, sig, direction=None):
     inputs_are_cupy = _CUPY_OK and (
         isinstance(sig1, _cp.ndarray) or isinstance(sig2, _cp.ndarray)
         or isinstance(h1, _cp.ndarray) or isinstance(h2, _cp.ndarray))
-    use_gpu_path = (_CUPY_OK and USE_GPU) or inputs_are_cupy
+    use_gpu_path = (_CUPY_OK and use_gpu()) or inputs_are_cupy
 
     if use_gpu_path:
         direction_g = _cp.asarray(direction)
@@ -432,7 +432,7 @@ def _scattering(self, sig):
 
     inputs_are_cupy = _CUPY_OK and (
         isinstance(e, _cp.ndarray) or isinstance(h, _cp.ndarray))
-    use_gpu_path = (_CUPY_OK and USE_GPU) or inputs_are_cupy
+    use_gpu_path = (_CUPY_OK and use_gpu()) or inputs_are_cupy
     if use_gpu_path:
         e_g = _cp.asarray(e)
         h_g = _cp.asarray(h)

@@ -2435,7 +2435,8 @@ class LayerStructure(object):
             for i2 in range(n_layers):
                 if iz1[i1][i2] is not None:
                     # Adjust z-values
-                    z1_adj, z2_adj = self._adjust(iz1[i1][i2], iz2[i1][i2], scale = scale)
+                    z1_adj, z2_adj = self._adjust(iz1[i1][i2], iz2[i1][i2], scale = scale,
+                                                  nz = (nz_arr[i1], nz_arr[i2]))
 
                     # Scale radii
                     r_range = ir[i1][i2]
@@ -2458,8 +2459,10 @@ class LayerStructure(object):
             z1: np.ndarray,
             z2: np.ndarray,
             scale: float = 1.05,
-            range_mode: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
+            range_mode: Optional[str] = None,
+            nz: Tuple[int, int] = (2, 2)) -> Tuple[np.ndarray, np.ndarray]:
         # MATLAB: private/adjust.m
+        # nz: number of tabulated z1 and z2 values (see _enlarge)
         i1, _ = self.indlayer(np.array([z1[0]]))
         i2, _ = self.indlayer(np.array([z2[0]]))
         i1 = int(np.asarray(i1).flat[0])
@@ -2471,8 +2474,8 @@ class LayerStructure(object):
             zlayer[i, 0] = self.z[i] if i < len(self.z) else -np.inf
             zlayer[i, 1] = self.z[i - 1] if i > 0 else np.inf
 
-        z1 = self._enlarge(z1, zlayer[i1 - 1, :], scale, range_mode)
-        z2 = self._enlarge(z2, zlayer[i2 - 1, :], scale, range_mode)
+        z1 = self._enlarge(z1, zlayer[i1 - 1, :], scale, range_mode, nz[0])
+        z2 = self._enlarge(z2, zlayer[i2 - 1, :], scale, range_mode, nz[1])
 
         # Handle uppermost and lowermost layer
         if i1 == 1 and i2 == 1:
@@ -2488,7 +2491,8 @@ class LayerStructure(object):
             z: np.ndarray,
             zlayer: np.ndarray,
             scale: float,
-            range_mode: Optional[str]) -> np.ndarray:
+            range_mode: Optional[str],
+            nz: int = 2) -> np.ndarray:
         z = np.asarray(z, dtype = float).copy()
         if np.abs(z[0] - z[1]) < 1e-10:
             z = np.array([z[0] - 1e-2, z[0] + 1e-2])
@@ -2497,14 +2501,16 @@ class LayerStructure(object):
             z = np.array([mean_z + 0.5 * scale * (z[0] - z[1]),
                           mean_z - 0.5 * scale * (z[0] - z[1])])
 
-        # NOTE: use <= / >= so that values exactly on a layer boundary are
-        # nudged inward by 1e-10. Without this nudge the downstream
-        # _zlinlogspace evaluates log10(zmin - obj.z[i]) = log10(0) = -inf and
-        # produces NaN tabulation grids (Issue 3 — metal substrate trigger
-        # case where the particle bottom sits exactly on the interface).
+        # A lower limit on the interface below the layer is nudged inward by 1e-10 (MATLAB: strict <). indlayer
+        # assigns a point on an interface to the layer below, so MATLAB's grid for this limit is NaN or complex
+        # (Issue 3, particle bottom exactly on the interface).
+        # An upper limit on the interface above the layer stays there, as in MATLAB (strict >), when the table
+        # has at most two z-values (demospecret14: lower plate at z = -1e-2, nz = 2 in the substrate). With more
+        # z-values MATLAB's zlinlogspace gives NaN (lowest layer) or several values on the interface (intermediate
+        # layer), so it is nudged inward too.
         if z[0] <= zlayer[0]:
             z[0] = zlayer[0] + 1e-10
-        if z[1] >= zlayer[1]:
+        if z[1] > zlayer[1] or (z[1] == zlayer[1] and nz > 2):
             z[1] = zlayer[1] - 1e-10
 
         if range_mode == 'full':
@@ -2614,7 +2620,12 @@ class LayerStructure(object):
             zlo = self.z[medium - 1]
             zmin_scaled = 2 * (zmin - zlo) / (zup - zlo) - 1
             zmax_scaled = 2 * (zmax - zlo) / (zup - zlo) - 1
-            z_scaled = mtanh(mlinspace(np.arctanh(zmin_scaled), np.arctanh(zmax_scaled), n))
+            # MATLAB linspace also sets the first value (mlinspace only the last one). This matters when zmax
+            # lies on the interface above (atanh(1) = inf), which _enlarge keeps for two z-values.
+            t = mlinspace(np.arctanh(zmin_scaled), np.arctanh(zmax_scaled), n)
+            if n > 1:
+                t[0] = np.arctanh(zmin_scaled)
+            z_scaled = mtanh(t)
             return 0.5 * (zup + zlo) + 0.5 * z_scaled * (zup - zlo)
 
     @staticmethod

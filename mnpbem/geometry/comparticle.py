@@ -6,6 +6,8 @@ Compound particle with multiple materials.
 Matches MATLAB MNPBEM @comparticle implementation exactly.
 """
 
+from typing import Any, List
+
 import numpy as np
 from .particle import Particle
 
@@ -79,14 +81,17 @@ class ComParticle(object):
         particles, closed_args = self._getinput(particles, closed_args, kwargs)
 
         # Handle particle list (may be nested list from MATLAB style)
+        # MATLAB @compound stores all particles, inout and closed, and returns
+        # the masked ones (obj.p( obj.mask ) etc.) on outside access; the full
+        # lists are kept in _p_all / _inout_all / _closed_all here.
         if isinstance(particles, list):
             if len(particles) > 0 and isinstance(particles[0], list):
                 # Flatten nested list: [[p1]] -> [p1]
-                self.p = [item for sublist in particles for item in sublist]
+                self._p_all = [item for sublist in particles for item in sublist]
             else:
-                self.p = particles
+                self._p_all = particles
         else:
-            self.p = [particles]
+            self._p_all = [particles]
 
         # Convert inout to numpy array (MATLAB uses 1-indexing)
         inout_arr = np.atleast_2d(np.asarray(inout))
@@ -94,11 +99,11 @@ class ComParticle(object):
             raise ValueError(
                 "ComParticle: 'inout' must be a list of [in, out] pairs with "
                 "shape (n, 2); got shape {}.".format(inout_arr.shape))
-        if inout_arr.shape[0] != len(self.p):
+        if inout_arr.shape[0] != len(self._p_all):
             raise ValueError(
                 "ComParticle: 'inout' must have one row per particle; got "
                 "{} particles vs {} inout rows."
-                .format(len(self.p), inout_arr.shape[0]))
+                .format(len(self._p_all), inout_arr.shape[0]))
         # eps indices in inout are 1-based (MATLAB) — must be within range.
         max_idx = int(inout_arr.max()) if inout_arr.size > 0 else 0
         if max_idx > len(eps):
@@ -109,10 +114,10 @@ class ComParticle(object):
             raise ValueError(
                 "ComParticle: 'inout' indices are 1-based; got minimum {}."
                 .format(int(inout_arr.min())))
-        self.inout = inout_arr
+        self._inout_all = inout_arr
 
-        # Mask (default: all particles active)
-        self._mask = list(range(len(self.p)))
+        # Mask (default: all particles active), 0-based indices into _p_all
+        self._mask_ind = list(range(len(self._p_all)))
 
         # Initialize closed surfaces (MATLAB: init.m)
         # Note: MATLAB demos always pass per-sub-particle closed args
@@ -120,12 +125,11 @@ class ComParticle(object):
         # closed_args is empty here, ``compgreen_ret._initclosed`` applies a
         # default per-sub-particle closed convention so the Fuchs-Liu
         # surface-integral identity (-2*pi for closed surface) holds.
-        self.closed = [None] * len(self.p)
+        self._closed_all = [None] * len(self._p_all)
         if len(closed_args) > 0:
             self.set_closed(*closed_args)
 
         # Compute auxiliary properties and create pc
-        self._compute_properties()
         self._norm()
 
     def _getinput(self, particles, closed_args, kwargs):
@@ -170,7 +174,11 @@ class ComParticle(object):
 
         MATLAB: norm(obj)
         """
-        # Create concatenated particle (vertcat all particles)
+        # Counts and boundary index of the masked particles
+        self._compute_properties()
+
+        # Create concatenated particle (vertcat all masked particles)
+        # MATLAB @compound/mask.m: obj.pc = vertcat( obj.p{ ind( : ) } )
         if len(self.p) > 0:
             self.pc = self.p[0]
             for p in self.p[1:]:
@@ -186,6 +194,57 @@ class ComParticle(object):
         if qk is not None and hasattr(self.pc, 'quad'):
             from ..utils.quadface import QuadFace as _QuadFace
             self.pc.quad = _QuadFace(**qk)
+
+    # ==================== Masked views (MATLAB @compound/subsref) ====================
+
+    def _is_unmasked(self) -> bool:
+        return self._mask_ind == list(range(len(self._p_all)))
+
+    # MATLAB: obj.p -> obj.p( obj.mask )
+    @property
+    def p(self) -> List[Particle]:
+        if self._is_unmasked():
+            return self._p_all
+        return [self._p_all[i] for i in self._mask_ind]
+
+    @p.setter
+    def p(self, value: List[Particle]) -> None:
+        self._p_all = value
+
+    # MATLAB: obj.inout -> obj.inout( obj.mask, : )
+    @property
+    def inout(self) -> np.ndarray:
+        if self._is_unmasked():
+            return self._inout_all
+        return self._inout_all[self._mask_ind, :]
+
+    @inout.setter
+    def inout(self, value: np.ndarray) -> None:
+        self._inout_all = value
+
+    # MATLAB @comparticle/subsref: obj.closed -> obj.closed( obj.mask )
+    @property
+    def closed(self) -> List[Any]:
+        if self._is_unmasked():
+            return self._closed_all
+        return [self._closed_all[i] for i in self._mask_ind]
+
+    @closed.setter
+    def closed(self, value: List[Any]) -> None:
+        self._closed_all = value
+
+    @property
+    def _mask(self) -> List[int]:
+        # Index into the masked views p / inout, which already hold the masked
+        # particles only.  Kept for code that applies MATLAB's
+        # p.inout( p.mask, : ) to these views (e.g. DipoleRet._connect).
+        return list(range(len(self._mask_ind)))
+
+    @_mask.setter
+    def _mask(self, value: List[int]) -> None:
+        # assignment as before: indices into all particles (use set_mask to
+        # also rebuild pc)
+        self._mask_ind = list(value)
 
     def _compute_properties(self):
         """Compute derived properties."""
@@ -254,17 +313,17 @@ class ComParticle(object):
                     # Set closed property if not previously set (1-indexed!).
                     # Store a copy so subsequent mutations of the input or of
                     # one entry's list do not alias other sub-particles.
-                    if self.closed[ind_abs - 1] is None:
-                        self.closed[ind_abs - 1] = list(indices)
+                    if self._closed_all[ind_abs - 1] is None:
+                        self._closed_all[ind_abs - 1] = list(indices)
             # Input is an additional particle
             else:
                 idx = arg[0] if np.isscalar(arg[0]) else arg[0][0]
                 # Vertcat particles
-                particles_to_concat = [self.p[idx - 1]] + list(arg[1:])
+                particles_to_concat = [self._p_all[idx - 1]] + list(arg[1:])
                 combined = particles_to_concat[0]
                 for p in particles_to_concat[1:]:
                     combined = combined + p
-                self.closed[idx - 1] = combined
+                self._closed_all[idx - 1] = combined
 
     def closedparticle(self, ind):
         """
@@ -275,7 +334,8 @@ class ComParticle(object):
         Parameters
         ----------
         ind : int
-            Particle index (1-indexed like MATLAB)
+            Index of the particle among the masked particles (1-indexed
+            like MATLAB, as in the loops over p.p of the Green functions)
 
         Returns
         -------
@@ -287,20 +347,23 @@ class ComParticle(object):
             If closed particle is contained in pc, loc points to the
             elements of the closed particle (None otherwise)
         """
-        idx = ind - 1  # Convert to 0-indexed
+        # Position of the particle in the full particle list; the closed
+        # entries refer to full particle indices (1-indexed)
+        idx = self._mask_ind[ind - 1]
+        ind_full = idx + 1
 
-        if self.closed[idx] is None:
+        if self._closed_all[idx] is None:
             return None, None, None
 
-        elif isinstance(self.closed[idx], Particle):
-            return self.closed[idx], 1, None
+        elif isinstance(self._closed_all[idx], Particle):
+            return self._closed_all[idx], 1, None
 
         else:
-            closed_list = self.closed[idx]
+            closed_list = self._closed_all[idx]
             # Find direction
             dir_val = None
             for c in closed_list:
-                if abs(c) == ind:
+                if abs(c) == ind_full:
                     dir_val = np.sign(c) if c != 0 else 1
                     break
 
@@ -311,7 +374,7 @@ class ComParticle(object):
             abs_closed = [abs(c) for c in closed_list]
             sign_closed = [np.sign(c) if c != 0 else 1 for c in closed_list]
 
-            particles = [self.p[i - 1] for i in abs_closed]
+            particles = [self._p_all[i - 1] for i in abs_closed]
 
             # Flip faces where direction doesn't match
             for i, (p, sign) in enumerate(zip(particles, sign_closed)):
@@ -371,26 +434,28 @@ class ComParticle(object):
         obj : ComParticle
             Selected comparticle
         """
+        # MATLAB select.m is a class method and works on all particles
+        # (masked or not); the mask is reset at the end
         if 'index' not in kwargs:
             # Pass select input to all particle objects
             new_particles = []
-            for p in self.p:
+            for p in self._p_all:
                 p_selected, _ = p.select(**kwargs)
                 new_particles.append(p_selected)
-            self.p = new_particles
+            self._p_all = new_particles
         else:
             # Index to grouped particles
             index = kwargs['index']
 
             # Create particle index for each face
             ipt = []
-            for i, p in enumerate(self.p):
+            for i, p in enumerate(self._p_all):
                 ipt.extend([i] * p.nfaces)
             ipt = np.array(ipt)
 
             # Point index (global face index)
             ind_global = []
-            for p in self.p:
+            for p in self._p_all:
                 ind_global.extend(range(p.nfaces))
             ind_global = np.array(ind_global)
 
@@ -400,26 +465,26 @@ class ComParticle(object):
 
             # Loop over all particles
             new_particles = []
-            for i in range(len(self.p)):
+            for i in range(len(self._p_all)):
                 # Get local indices for this particle
                 mask = (ipt_selected == i)
                 if mask.any():
                     local_ind = ind_selected[mask]
-                    p_selected, _ = self.p[i].select(index=local_ind)
+                    p_selected, _ = self._p_all[i].select(index=local_ind)
                     new_particles.append(p_selected)
 
-            self.p = new_particles
+            self._p_all = new_particles
 
         # Keep only non-empty particles
-        non_empty = [i for i, p in enumerate(self.p) if p.nfaces > 0]
-        self.p = [self.p[i] for i in non_empty]
-        self.inout = self.inout[non_empty, :]
+        non_empty = [i for i, p in enumerate(self._p_all) if p.nfaces > 0]
+        self._p_all = [self._p_all[i] for i in non_empty]
+        self._inout_all = self._inout_all[non_empty, :]
 
         # Reset closed arguments
-        self.closed = [None] * len(self.p)
+        self._closed_all = [None] * len(self._p_all)
 
         # Update mask
-        self._mask = list(range(len(self.p)))
+        self._mask_ind = list(range(len(self._p_all)))
 
         # Update compound particle
         self._norm()
@@ -434,7 +499,7 @@ class ComParticle(object):
 
         MATLAB: clean(obj, varargin)
         """
-        self.p = [p.clean(*args, **kwargs) for p in self.p]
+        self._p_all = [p.clean(*args, **kwargs) for p in self._p_all]
         self._norm()
         return self
 
@@ -444,7 +509,7 @@ class ComParticle(object):
 
         MATLAB: flip(obj, varargin)
         """
-        self.p = [p.flip(*args, **kwargs) for p in self.p]
+        self._p_all = [p.flip(*args, **kwargs) for p in self._p_all]
         self._norm()
         return self
 
@@ -454,7 +519,7 @@ class ComParticle(object):
 
         MATLAB: flipfaces(obj, varargin)
         """
-        self.p = [p.flipfaces(*args, **kwargs) for p in self.p]
+        self._p_all = [p.flipfaces(*args, **kwargs) for p in self._p_all]
         self._norm()
         return self
 
@@ -464,7 +529,7 @@ class ComParticle(object):
 
         MATLAB: rot(obj, varargin)
         """
-        self.p = [p.rot(*args, **kwargs) for p in self.p]
+        self._p_all = [p.rot(*args, **kwargs) for p in self._p_all]
         self._norm()
         return self
 
@@ -474,7 +539,7 @@ class ComParticle(object):
 
         MATLAB: scale(obj, varargin)
         """
-        self.p = [p.scale(*args, **kwargs) for p in self.p]
+        self._p_all = [p.scale(*args, **kwargs) for p in self._p_all]
         self._norm()
         return self
 
@@ -484,7 +549,7 @@ class ComParticle(object):
 
         MATLAB: shift(obj, varargin)
         """
-        self.p = [p.shift(*args, **kwargs) for p in self.p]
+        self._p_all = [p.shift(*args, **kwargs) for p in self._p_all]
         self._norm()
         return self
 
@@ -730,8 +795,8 @@ class ComParticle(object):
 
         MATLAB: obj.mask
         """
-        mask_arr = np.zeros(len(self.p), dtype=bool)
-        mask_arr[self._mask] = True
+        mask_arr = np.zeros(len(self._p_all), dtype=bool)
+        mask_arr[self._mask_ind] = True
         return mask_arr
 
     def set_mask(self, ind):
@@ -743,11 +808,15 @@ class ComParticle(object):
         Parameters
         ----------
         ind : array_like
-            Indices of particles to keep (1-indexed like MATLAB)
+            Indices of particles to keep (1-indexed like MATLAB), all
+            particles if None or empty
         """
+        # MATLAB @compound/mask.m: default mask to all particles
+        if ind is None or np.size(ind) == 0:
+            ind = range(1, len(self._p_all) + 1)
         if np.isscalar(ind):
             ind = [ind]
-        self._mask = [i - 1 for i in ind]  # Convert to 0-indexed
+        self._mask_ind = [int(i) - 1 for i in ind]  # Convert to 0-indexed
         self._norm()
         return self
 
@@ -859,30 +928,37 @@ class ComParticle(object):
             points/particles can see each other. Non-zero entries indicate
             the shared medium index.
         """
+        # Masked inout property, MATLAB: get = @( p ) ( p.inout( p.mask, : ) );
+        # the inout views of ComParticle / ComPoint hold the masked rows already,
+        # ComPoint stores one medium per point group (a column)
+        def get(p: Any) -> np.ndarray:
+            io = np.asarray(p.inout)
+            return io.reshape(-1, 1) if io.ndim == 1 else io
+
         # Parse arguments
         if len(args) == 1:
             # Single particle
             p1 = args[0]
-            inout1 = p1.inout[p1._mask, :]
+            inout1 = get(p1)
             inout_list = [inout1]
         elif len(args) == 2:
             if isinstance(args[1], np.ndarray) and args[1].ndim == 1:
                 # Single particle + index replacement
                 p1 = args[0]
                 ind = args[1]
-                inout1 = ind[p1.inout[p1._mask, :] - 1]  # MATLAB is 1-indexed
+                inout1 = ind[get(p1) - 1]  # MATLAB is 1-indexed
                 inout_list = [inout1]
             else:
                 # Two particles
                 p1, p2 = args[0], args[1]
-                inout1 = p1.inout[p1._mask, :]
-                inout2 = p2.inout[p2._mask, :]
+                inout1 = get(p1)
+                inout2 = get(p2)
                 inout_list = [inout1, inout2]
         elif len(args) == 3:
             # Two particles + index replacement
             p1, p2, ind = args[0], args[1], args[2]
-            inout1 = ind[p1.inout[p1._mask, :] - 1]
-            inout2 = ind[p2.inout[p2._mask, :] - 1]
+            inout1 = ind[get(p1) - 1]
+            inout2 = ind[get(p2) - 1]
             inout_list = [inout1, inout2]
         else:
             raise ValueError('[error] Invalid number of arguments for connect()')
@@ -928,7 +1004,7 @@ class ComParticle(object):
         if self.inout.size != len(self.p):
             # inout has 2 columns: pick the relevant column
             col = inout - 1  # Convert to 0-indexed column
-            indices = self.inout[self._mask, col]
+            indices = self.inout[:, col]
             return [eps_table[idx - 1] for idx in indices]  # 1-indexed to 0-indexed
         else:
             return eps_table
@@ -949,7 +1025,7 @@ class ComParticle(object):
         full : ndarray
             Expanded values, one per face of all masked particles
         """
-        sizes = [self.p[i].nfaces for i in self._mask]
+        sizes = [part.nfaces for part in self.p]
 
         if not isinstance(val, (list, tuple)):
             # Scalar or array: replicate for all faces
@@ -1005,7 +1081,7 @@ class ComParticle(object):
             Local face index within the particle
         """
         ind = np.atleast_1d(ind)
-        sizes = np.array([self.p[i].nfaces for i in self._mask])
+        sizes = np.array([part.nfaces for part in self.p])
         cumulative = np.zeros(len(sizes) + 1, dtype = int)
         cumulative[1:] = np.cumsum(sizes)
 
@@ -1042,7 +1118,7 @@ class ComParticle(object):
 
         MATLAB: compound.size property
         """
-        return np.array([self.p[i].nfaces for i in self._mask])
+        return np.array([part.nfaces for part in self.p])
 
     def __repr__(self):
         return (

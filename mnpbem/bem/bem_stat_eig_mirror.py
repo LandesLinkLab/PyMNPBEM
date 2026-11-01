@@ -12,6 +12,7 @@ from ..utils.gpu import (
     matmul_dispatch, solve_dispatch, to_host, is_cupy_array,
     eig_dispatch,
 )
+from ..utils import gpu as _gpu_mod
 from .bem_stat_mirror import _mirror_stat_eval_host
 
 
@@ -40,11 +41,10 @@ def _gpu_eig_available_cached_mir() -> bool:
     but local to the mirror module so neither calls into the other.
     """
     global _GPU_EIG_AVAIL_MIR
+    if not _cupy_calls_enabled():
+        return False
     if _GPU_EIG_AVAIL_MIR is not None:
         return _GPU_EIG_AVAIL_MIR
-    if not _CUPY_OK_EIGMIR:
-        _GPU_EIG_AVAIL_MIR = False
-        return False
     try:
         tiny = _cp_eigmir.asarray(np.eye(4, dtype=np.complex128))
         _cp_eigmir.linalg.eig(tiny)
@@ -60,9 +60,17 @@ except Exception:
     _CUPY_OK_EIGMIR = False
 
 
+def _cupy_calls_enabled() -> bool:
+    # The cupy pool / synchronize calls and the cupy eig probe of this module
+    # open a CUDA context, so they run only on the GPU path, as in the other
+    # solvers: utils.gpu.use_gpu(), i.e. MNPBEM_GPU=1 (read per call) and a
+    # visible device.
+    return _CUPY_OK_EIGMIR and _gpu_mod.use_gpu()
+
+
 def _gpu_pool_cleanup_eigmir(apply_limit: bool = False) -> None:
     """Synchronise CUDA stream then drain cupy default + pinned pools."""
-    if not _CUPY_OK_EIGMIR:
+    if not _cupy_calls_enabled():
         return
     try:
         mempool = _cp_eigmir.get_default_memory_pool()
@@ -215,11 +223,11 @@ class BEMStatEigMirror(object):
             # leave Arnoldi scratch in the pool when sparse eigs routes
             # through cupy.  Drain inside the loop so n_sym blocks don't
             # accumulate.
-            if _CUPY_OK_EIGMIR:
+            if _cupy_calls_enabled():
                 _gpu_pool_cleanup_eigmir()
 
         # final eigs-loop pool drain.
-        if _CUPY_OK_EIGMIR:
+        if _cupy_calls_enabled():
             _gpu_pool_cleanup_eigmir()
 
         if enei is not None:
@@ -230,7 +238,7 @@ class BEMStatEigMirror(object):
 
         MATLAB: @bemstateigmirror/subsref.m case '()'
         """
-        if self.enei is not None and np.isclose(self.enei, enei):
+        if self.enei is not None and self.enei == enei:
             return self
 
         # drop the previous wavelength's resolvent matrices
@@ -266,7 +274,7 @@ class BEMStatEigMirror(object):
             # drop per-block scratch so the next symmetry
             # iteration sees a clean pool.
             del inv_ul, resolvent, unit_lambda, unit_lambda_mat
-            if _CUPY_OK_EIGMIR:
+            if _cupy_calls_enabled():
                 _gpu_pool_cleanup_eigmir()
 
         self.enei = enei
@@ -363,7 +371,7 @@ class BEMStatEigMirror(object):
         """
         self.mat = None
         self.enei = None
-        if _CUPY_OK_EIGMIR:
+        if _cupy_calls_enabled():
             _gpu_pool_cleanup_eigmir()
         return self
 

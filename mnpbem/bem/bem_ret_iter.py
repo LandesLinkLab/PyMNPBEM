@@ -11,8 +11,9 @@ from scipy.sparse.linalg import LinearOperator
 from ..greenfun import CompStruct
 from ..utils.gpu import (
     lu_factor_dispatch, lu_solve_dispatch, lu_solve_native,
-    eye_like_lu, to_host, is_cupy_array,
+    eye_like_lu, to_host, is_cupy_array, vram_share_devices_visible,
 )
+from ..greenfun.hmatrix import _hmat_mgpu_available
 from ..utils.matlab_compat import msqrt
 from .bem_iter import BEMIter
 
@@ -37,6 +38,55 @@ except Exception:
     _CUPY_OK_ITER = False
 
 
+def _iter_gpu_enabled() -> bool:
+    # GPU work only with MNPBEM_GPU=1, read per call as in bem_ret.py
+    # (_bem_assembly_use_gpu).  _CUPY_OK_ITER additionally requires a device.
+    return _CUPY_OK_ITER and os.environ.get('MNPBEM_GPU', '0') == '1'
+
+
+def _iter_pool_calls_enabled() -> bool:
+    # The cupy pool / stream calls below create a CUDA context on first use, so
+    # run them only when this module can hold device memory: with MNPBEM_GPU=1,
+    # or with the multi-GPU H-matrix, which ACACompGreenRet enables from
+    # MNPBEM_HMATRIX_MULTI_GPU alone (hmatrix._hmat_mgpu_available).
+    return _iter_gpu_enabled() or (_CUPY_OK_ITER and _hmat_mgpu_available(min_devices = 2))
+
+
+def _interp_deriv(
+        p: Any,
+        v: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+
+    # MATLAB: [v1, v2, t1, t2] = deriv(p, interp(p, v)) for face values v of
+    # shape (nfaces, ...).  Particle.interp_values only takes 2-D arrays and
+    # Particle.deriv returns real arrays, so v is flattened to (nfaces, -1) and
+    # the real and imaginary parts are differentiated separately (deriv is linear).
+    siz = v.shape
+    vi = p.interp_values(v.reshape(siz[0], -1))[0]
+    re1, re2, t1, t2 = p.deriv(np.real(vi))
+    im1, im2 = p.deriv(np.imag(vi))[:2]
+    v1 = (re1 + 1j * im1).reshape((-1,) + siz[1:])
+    v2 = (re2 + 1j * im2).reshape((-1,) + siz[1:])
+    return v1, v2, t1, t2
+
+
+def _columnwise(
+        fun: Callable[[np.ndarray], np.ndarray],
+        n_rows: int,
+        ncol: int) -> Callable[[np.ndarray], np.ndarray]:
+
+    # Apply a single-excitation operator to every column of a stacked vector
+    # x_vec = x_cols.ravel(), x_cols of shape (n_rows, ncol).  Used by the
+    # Schur branches, whose operator acts on one excitation, to solve all
+    # excitations as one stacked GMRES system as MATLAB does (afun.m, mfun.m).
+    def _apply(x_vec: np.ndarray) -> np.ndarray:
+        x_cols = x_vec.reshape(n_rows, ncol)
+        y_cols = np.empty((n_rows, ncol), dtype = complex)
+        for j in range(ncol):
+            y_cols[:, j] = fun(x_cols[:, j])
+        return y_cols.ravel()
+    return _apply
+
+
 def _gpu_pool_cleanup_iter(apply_limit: bool = False) -> None:
     """Synchronise CUDA stream then drain cupy default + pinned pools.
 
@@ -48,7 +98,7 @@ def _gpu_pool_cleanup_iter(apply_limit: bool = False) -> None:
     Honours MNPBEM_GPU_POOL_LIMIT_GB (legitimate peaks past this cap will
     OOM; default 0 = uncapped).
     """
-    if not _CUPY_OK_ITER:
+    if not _iter_pool_calls_enabled():
         return
     try:
         mempool = _cp_iter.get_default_memory_pool()
@@ -98,11 +148,13 @@ def _vram_share_active() -> bool:
     """Return True when distributed-build is enabled.
 
     Activated when **all** of the following hold:
+    - ``MNPBEM_GPU=1`` (as in ``bem_ret._vram_share_active``)
     - ``MNPBEM_VRAM_SHARE=1``
     - ``MNPBEM_VRAM_SHARE_DISTRIBUTED=1`` (gates the heavier distributed
       build path; default off so existing call sites stay bit-identical)
     - ``MNPBEM_VRAM_SHARE_GPUS>=2``
     - cupy + cuSolverMg are importable
+    - the requested devices are visible (else one warning, no attempt)
 
     Distributed build assembles G/H matrices directly across N GPUs via
     ``DistributedMatrix.from_func`` + ``CompGreenRet.eval_block``, avoiding
@@ -111,6 +163,8 @@ def _vram_share_active() -> bool:
     Au@Ag dimer sweep where the per-wavelength precond pipeline would
     otherwise OOM around N~12k.
     """
+    if os.environ.get('MNPBEM_GPU', '0') != '1':
+        return False
     if os.environ.get('MNPBEM_VRAM_SHARE', '0') != '1':
         return False
     if os.environ.get('MNPBEM_VRAM_SHARE_DISTRIBUTED', '0') != '1':
@@ -125,9 +179,12 @@ def _vram_share_active() -> bool:
         return False
     try:
         from ..utils.multi_gpu_lu import cusolvermg_available
-        return bool(cusolvermg_available())
+        if not cusolvermg_available():
+            return False
     except Exception:
         return False
+    n_gpus, _, device_ids = _vram_share_env_config()
+    return vram_share_devices_visible(n_gpus, device_ids, 'BEMRetIter')
 
 
 def _vram_share_env_config() -> Tuple[int, str, Optional[List[int]]]:
@@ -608,7 +665,7 @@ class BEMRetIter(BEMIter):
         import gc as _gc
         _gc.collect()
         _gpu_pool_cleanup_iter(apply_limit = True)
-        if _CUPY_OK_ITER:
+        if _iter_pool_calls_enabled():
             _cp_iter.cuda.runtime.deviceSynchronize()
             _cp_iter.get_default_memory_pool().free_all_blocks()
             _cp_iter.get_default_pinned_memory_pool().free_all_blocks()
@@ -659,7 +716,7 @@ class BEMRetIter(BEMIter):
             # pool can reclaim their device buffers before the H1/H2 round
             # starts uploading the next ~2 N^2 of data.
             del G11, G21, G22, G12
-            if _CUPY_OK_ITER:
+            if _iter_pool_calls_enabled():
                 _cp_iter.get_default_memory_pool().free_all_blocks()
 
             H11 = self.g.eval(0, 0, 'H1', enei)
@@ -671,7 +728,7 @@ class BEMRetIter(BEMIter):
             self._H2 = H22 - H12 if not (isinstance(H12, (int, float)) and H12 == 0) else H22
             # same logic for the H-block intermediates.
             del H11, H21, H22, H12
-            if _CUPY_OK_ITER:
+            if _iter_pool_calls_enabled():
                 _cp_iter.cuda.runtime.deviceSynchronize()
                 _cp_iter.get_default_memory_pool().free_all_blocks()
 
@@ -693,7 +750,7 @@ class BEMRetIter(BEMIter):
             # transient G^{-1} / Sigma / nvec_outer GEMMs on the GPU
             # (~3 N^2 transient peak on 12672-face dimers).  Drain right
             # after init so the GMRES Krylov build below sees max headroom.
-            if _CUPY_OK_ITER:
+            if _iter_pool_calls_enabled():
                 _cp_iter.cuda.runtime.deviceSynchronize()
                 _cp_iter.get_default_memory_pool().free_all_blocks()
                 _cp_iter.get_default_pinned_memory_pool().free_all_blocks()
@@ -840,11 +897,12 @@ class BEMRetIter(BEMIter):
         # full() calls above (~10 GB even after _del_).  Drain the pool
         # before launching the GPU LU pipeline so the 49 GB single-GPU
         # cap is not exceeded by stale pool blocks.
-        try:
-            import cupy as _cp_local
-            _cp_local.get_default_memory_pool().free_all_blocks()
-        except Exception:
-            pass
+        if _iter_pool_calls_enabled():
+            try:
+                import cupy as _cp_local
+                _cp_local.get_default_memory_pool().free_all_blocks()
+            except Exception:
+                pass
 
         # Dielectric as diagonal matrices for matrix operations
         if np.isscalar(eps1) or (isinstance(eps1, np.ndarray) and eps1.ndim == 0):
@@ -881,7 +939,8 @@ class BEMRetIter(BEMIter):
             'MNPBEM_GPU_PRECOND_HOST_THRESHOLD', '32768'))
         N = G1.shape[0]
         use_gpu_serialized = (
-                N < gpu_overflow_cutoff
+                _iter_gpu_enabled()
+                and N < gpu_overflow_cutoff
                 and _gpu_precond_capacity_ok(N))
         if use_gpu_serialized:
             try:
@@ -905,7 +964,7 @@ class BEMRetIter(BEMIter):
             # G/H matrices may have just been pulled down from GPU (the
             # ``is_cupy_array`` checks above) and the staging buffer is
             # still sitting in the pool.
-            if _CUPY_OK_ITER:
+            if _iter_pool_calls_enabled():
                 _cp_iter.get_default_memory_pool().free_all_blocks()
             G1_lu_pkg = _scipy_lu_factor(G1, check_finite = False)
             G2_lu_pkg = _scipy_lu_factor(G2, check_finite = False)
@@ -1069,7 +1128,7 @@ class BEMRetIter(BEMIter):
         # different names than the host-fallback branch); the function
         # return below will collect them and the drain on entry to the
         # NEXT ``_init_matrices`` call catches anything that survives.
-        if _CUPY_OK_ITER:
+        if _iter_pool_calls_enabled():
             _cp_iter.cuda.runtime.deviceSynchronize()
             _cp_iter.get_default_memory_pool().free_all_blocks()
             _cp_iter.get_default_pinned_memory_pool().free_all_blocks()
@@ -1127,7 +1186,7 @@ class BEMRetIter(BEMIter):
                 n_gpus = n_gpus, device_ids = device_ids)
         self._G1 = dm_G1.to_host()
         dm_G1.free()
-        if _CUPY_OK_ITER:
+        if _iter_pool_calls_enabled():
             _cp_iter.get_default_memory_pool().free_all_blocks()
 
         dm_H1 = _distributed_block_assemble(
@@ -1137,7 +1196,7 @@ class BEMRetIter(BEMIter):
                 n_gpus = n_gpus, device_ids = device_ids)
         self._H1 = dm_H1.to_host()
         dm_H1.free()
-        if _CUPY_OK_ITER:
+        if _iter_pool_calls_enabled():
             _cp_iter.get_default_memory_pool().free_all_blocks()
 
         dm_G2 = _distributed_block_assemble(
@@ -1147,7 +1206,7 @@ class BEMRetIter(BEMIter):
                 n_gpus = n_gpus, device_ids = device_ids)
         self._G2 = dm_G2.to_host()
         dm_G2.free()
-        if _CUPY_OK_ITER:
+        if _iter_pool_calls_enabled():
             _cp_iter.get_default_memory_pool().free_all_blocks()
 
         dm_H2 = _distributed_block_assemble(
@@ -1157,7 +1216,7 @@ class BEMRetIter(BEMIter):
                 n_gpus = n_gpus, device_ids = device_ids)
         self._H2 = dm_H2.to_host()
         dm_H2.free()
-        if _CUPY_OK_ITER:
+        if _iter_pool_calls_enabled():
             _cp_iter.cuda.runtime.deviceSynchronize()
             _cp_iter.get_default_memory_pool().free_all_blocks()
             _cp_iter.get_default_pinned_memory_pool().free_all_blocks()
@@ -1165,8 +1224,8 @@ class BEMRetIter(BEMIter):
 
     @staticmethod
     def _gpu_mfun_enabled() -> bool:
-        # Opt-in.  Default OFF leaves the host matmul path unchanged.
-        return os.environ.get('MNPBEM_AGGRESSIVE_GPU_MFUN', '0') == '1'
+        # Opt-in on top of MNPBEM_GPU=1.  Default OFF leaves the host matmul path unchanged.
+        return _iter_gpu_enabled() and os.environ.get('MNPBEM_AGGRESSIVE_GPU_MFUN', '0') == '1'
 
     @staticmethod
     def _decorate_deltai(
@@ -1219,6 +1278,34 @@ class BEMRetIter(BEMIter):
         ap = vec_2d[:, 5:8].reshape(n, 3, siz, order = 'F') if siz > 1 else vec_2d[:, 5:8].reshape(n, 3)
 
         return phi, a, phip, ap
+
+    def _split_excitations(self,
+            vec: np.ndarray,
+            ncol: int) -> np.ndarray:
+
+        # packed vector of ncol excitations (_pack layout: phi, a, phip, ap
+        # blocks of n, 3n, n, 3n entries per excitation) -> (ncol, 8n) array
+        # whose row j is the packed vector of excitation j alone
+        n = self.p.n if hasattr(self.p, 'n') else self.p.nfaces
+        rows = np.empty((ncol, 8 * n), dtype = vec.dtype)
+        offset = 0
+        for col0, width in ((0, n), (n, 3 * n), (4 * n, n), (5 * n, 3 * n)):
+            rows[:, col0:col0 + width] = vec[offset:offset + width * ncol].reshape(ncol, width)
+            offset += width * ncol
+        return rows
+
+    def _join_excitations(self,
+            rows: np.ndarray) -> np.ndarray:
+
+        # inverse of _split_excitations
+        n = self.p.n if hasattr(self.p, 'n') else self.p.nfaces
+        ncol = rows.shape[0]
+        vec = np.empty(rows.size, dtype = rows.dtype)
+        offset = 0
+        for col0, width in ((0, n), (n, 3 * n), (4 * n, n), (5 * n, 3 * n)):
+            vec[offset:offset + width * ncol] = rows[:, col0:col0 + width].ravel()
+            offset += width * ncol
+        return vec
 
     @staticmethod
     def _outer(
@@ -1645,7 +1732,7 @@ class BEMRetIter(BEMIter):
         # buffers in the pool; releasing them now keeps the per-iter
         # matvec / preconditioner-apply allocations from triggering a
         # fragmentation-induced OOM mid-sweep.
-        if _CUPY_OK_ITER:
+        if _iter_pool_calls_enabled():
             _cp_iter.cuda.runtime.deviceSynchronize()
             _cp_iter.get_default_memory_pool().free_all_blocks()
         _gpu_pool_cleanup_iter()
@@ -1658,12 +1745,25 @@ class BEMRetIter(BEMIter):
             # cover-layer geometries the reduced system is well-
             # conditioned enough for unpreconditioned GMRES.
             op = self._schur_op
-            b_eff = op.reduce_rhs(b)
-            x_core, _ = self._iter_solve(None, b_eff, op._matvec, None)
-            x = op.recover_full(x_core, b)
+
+            # The Schur operator acts on the packed vector of one excitation.
+            # As in MATLAB (solve.m, afun.m), all excitations are solved as one
+            # stacked vector, with the operator applied excitation by excitation.
+            n_core = op.shape[0]
+            ncol = b.size // (8 * op.nfaces)
+            b_rows = self._split_excitations(b, ncol)
+            b_eff = np.empty((n_core, ncol), dtype = complex)
+            for j in range(ncol):
+                b_eff[:, j] = op.reduce_rhs(b_rows[j])
+            x_core, _ = self._iter_solve(None, b_eff.ravel(), _columnwise(op._matvec, n_core, ncol), None)
+            x_core = x_core.reshape(n_core, ncol)
+            x_rows = np.empty((ncol, 8 * op.nfaces), dtype = complex)
+            for j in range(ncol):
+                x_rows[j] = op.recover_full(x_core[:, j], b_rows[j])
+            x = self._join_excitations(x_rows)
             # drop the Schur-reduced solution vector handle.
             del x_core
-            if _CUPY_OK_ITER:
+            if _iter_pool_calls_enabled():
                 _cp_iter.cuda.runtime.deviceSynchronize()
                 _cp_iter.get_default_memory_pool().free_all_blocks()
         else:
@@ -1690,7 +1790,7 @@ class BEMRetIter(BEMIter):
             # the pool before the next wavelength's init drains the prior
             # state.
             del fa, fm
-            if _CUPY_OK_ITER:
+            if _iter_pool_calls_enabled():
                 _cp_iter.cuda.runtime.deviceSynchronize()
                 _cp_iter.get_default_memory_pool().free_all_blocks()
 
@@ -1725,7 +1825,7 @@ class BEMRetIter(BEMIter):
         # solve-exit cleanup: drain any residual transient buffers
         # before returning so the caller's wavelength loop sees a fully
         # drained pool when it advances to the next enei.
-        if _CUPY_OK_ITER:
+        if _iter_pool_calls_enabled():
             _cp_iter.get_default_memory_pool().free_all_blocks()
             _cp_iter.get_default_pinned_memory_pool().free_all_blocks()
         _gpu_pool_cleanup_iter()
@@ -1796,8 +1896,8 @@ class BEMRetIter(BEMIter):
             phi, phip, a, ap = pot.phi2, pot.phi2p, pot.a2, pot.a2p
 
         # Tangential directions via interpolation
-        phi1_d, phi2_d = self.p.deriv(self.p.interp(phi))[:2]
-        a1_d, a2_d, t1, t2 = self.p.deriv(self.p.interp(a))
+        phi1_d, phi2_d = _interp_deriv(self.p, phi)[:2]
+        a1_d, a2_d, t1, t2 = _interp_deriv(self.p, a)
 
         # Normal vector
         nvec = np.cross(t1, t2)
@@ -1848,7 +1948,7 @@ class BEMRetIter(BEMIter):
         # explicit clear() means the user wants the device drained.
         # Without this the LU factors / G blocks just released above stay
         # in the cupy pool until the next solve triggers a free_all_blocks.
-        if _CUPY_OK_ITER:
+        if _iter_pool_calls_enabled():
             _cp_iter.cuda.runtime.deviceSynchronize()
             _cp_iter.get_default_memory_pool().free_all_blocks()
             _cp_iter.get_default_pinned_memory_pool().free_all_blocks()

@@ -9,7 +9,7 @@ from typing import List, Dict, Tuple, Optional, Union, Any, Callable
 import numpy as np
 from scipy.linalg import lu_factor, lu_solve
 
-from ..utils.gpu import lu_factor_dispatch, lu_solve_dispatch, matmul_dispatch, to_host, is_cupy_array
+from ..utils.gpu import lu_factor_dispatch, lu_solve_dispatch, matmul_dispatch, to_host, is_cupy_array, keep_cuda_device
 from ..utils import gpu as _gpu_mod
 
 from ..greenfun import CompGreenRetLayer, CompStruct
@@ -35,6 +35,13 @@ try:
 except Exception:
     _cp_v172 = None  # type: ignore
     _CUPY_OK_V172 = False
+
+
+def _cupy_calls_enabled() -> bool:
+    # The cupy pool / synchronize calls of this module open a CUDA context, so
+    # they (and the distributed build gated on this) run only on the GPU path:
+    # utils.gpu.use_gpu(), i.e. MNPBEM_GPU=1 (read per call) and a visible device.
+    return _CUPY_OK_V172 and _gpu_mod.use_gpu()
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +98,7 @@ def _assemble_m_blocks_resident(
     GPU path is unavailable so the caller falls back to the host path
     (numerically identical, just slower).
     """
-    if not (_CUPY_OK_V172 and getattr(_gpu_mod, 'USE_GPU', False)):
+    if not _cupy_calls_enabled():
         return None
     if _vram_share_active():
         # Multi-GPU column-split assembly is owned by matmul_dispatch's
@@ -226,7 +233,7 @@ def _vram_share_active() -> bool:
     wants the LU split can leave ``MNPBEM_VRAM_SHARE_DISTRIBUTED=0`` and
     keep the legacy host build.
     """
-    if not _CUPY_OK_V172:
+    if not _cupy_calls_enabled():
         return False
     if os.environ.get('MNPBEM_VRAM_SHARE', '0') != '1':
         return False
@@ -423,7 +430,7 @@ class BEMRetLayer(object):
     def init(self,
             enei: float) -> 'BEMRetLayer':
 
-        if self.enei is not None and np.isclose(self.enei, enei):
+        if self.enei is not None and self.enei == enei:
             return self
 
         # When the distributed-build gate is on, route
@@ -494,7 +501,7 @@ class BEMRetLayer(object):
             _gc.collect()
         except Exception:
             pass
-        if _CUPY_OK_V172:
+        if _cupy_calls_enabled():
             try:
                 _mempool_pre = _cp_v172.get_default_memory_pool()
                 _pinned_pre = _cp_v172.get_default_pinned_memory_pool()
@@ -549,7 +556,7 @@ class BEMRetLayer(object):
         eps1_vals = self.p.eps1(enei)
         eps2_vals = self.p.eps2(enei)
 
-        if np.allclose(eps1_vals, eps1_vals[0]) and np.allclose(eps2_vals, eps2_vals[0]):
+        if np.all(eps1_vals == eps1_vals[0]) and np.all(eps2_vals == eps2_vals[0]):
             eps1 = eps1_vals[0]
             eps2 = eps2_vals[0]
         else:
@@ -601,7 +608,7 @@ class BEMRetLayer(object):
         # combined G1/G1e/H1/H1e are formed.  Mirrors BEMRet's per-stage
         # del + free_all_blocks pattern.
         del G11, G21, H11, H21
-        if _CUPY_OK_V172:
+        if _cupy_calls_enabled():
             try:
                 _cp_v172.cuda.runtime.deviceSynchronize()
                 _cp_v172.get_default_memory_pool().free_all_blocks()
@@ -641,7 +648,7 @@ class BEMRetLayer(object):
         # block); freeing it now keeps the pool from carrying double the
         # peak through the LU factorizations below.
         del G22, G12, H22, H12
-        if _CUPY_OK_V172:
+        if _cupy_calls_enabled():
             try:
                 _cp_v172.cuda.runtime.deviceSynchronize()
                 _cp_v172.get_default_memory_pool().free_all_blocks()
@@ -704,7 +711,7 @@ class BEMRetLayer(object):
             G2pi = lu_solve_dispatch(self._G2p_lu, np.eye(G2['p'].shape[0], dtype=_wd))
             # free pools after the two G LU factorizations + their
             # inverses (each LU is ~N^2 complex; the eye-product N^2 too).
-            if _CUPY_OK_V172:
+            if _cupy_calls_enabled():
                 try:
                     _cp_v172.cuda.runtime.deviceSynchronize()
                     _cp_v172.get_default_memory_pool().free_all_blocks()
@@ -723,7 +730,7 @@ class BEMRetLayer(object):
             # needed after Sigma/L are formed.  Drop the local refs so the
             # cupy pool can recycle them before the m_full GEMMs below.
             del H1, H1e, G1e
-            if _CUPY_OK_V172:
+            if _cupy_calls_enabled():
                 try:
                     _cp_v172.cuda.runtime.deviceSynchronize()
                     _cp_v172.get_default_memory_pool().free_all_blocks()
@@ -734,7 +741,7 @@ class BEMRetLayer(object):
             self._Gamma_lu = lu_factor_dispatch(Sigma1 - Sigma2p, **_vram_share_lu_kwargs())
             Gamma = lu_solve_dispatch(self._Gamma_lu, np.eye(Sigma1.shape[0], dtype=_wd))
             del Sigma2p
-            if _CUPY_OK_V172:
+            if _cupy_calls_enabled():
                 try:
                     _cp_v172.cuda.runtime.deviceSynchronize()
                     _cp_v172.get_default_memory_pool().free_all_blocks()
@@ -820,7 +827,7 @@ class BEMRetLayer(object):
             # forms; drop them so the m_full assemble below sees max
             # headroom.  H2/H2e remain only via their already-formed terms.
             del diff_ss, diff_sh, diff_hh, Gammapar, H2, H2e
-            if _CUPY_OK_V172:
+            if _cupy_calls_enabled():
                 try:
                     _cp_v172.cuda.runtime.deviceSynchronize()
                     _cp_v172.get_default_memory_pool().free_all_blocks()
@@ -838,7 +845,7 @@ class BEMRetLayer(object):
             m_full[n:, :n] = m21
             m_full[n:, n:] = m22
             del m11, m12, m21, m22
-            if _CUPY_OK_V172:
+            if _cupy_calls_enabled():
                 try:
                     _cp_v172.cuda.runtime.deviceSynchronize()
                     _cp_v172.get_default_memory_pool().free_all_blocks()
@@ -853,7 +860,7 @@ class BEMRetLayer(object):
             # factor; drop the local handle so its 4*N^2 complex buffer
             # returns to the pool before we exit init().
             del m_full
-            if _CUPY_OK_V172:
+            if _cupy_calls_enabled():
                 try:
                     _cp_v172.cuda.runtime.deviceSynchronize()
                     _cp_v172.get_default_memory_pool().free_all_blocks()
@@ -987,7 +994,7 @@ class BEMRetLayer(object):
         # LU/Sigma/Gamma allocation has been compacted out of the cupy
         # pool before the BEM solver returns to the caller.  Mirrors
         # BEMRet._init_gpu_assemble's closing free_all_blocks pair.
-        if _CUPY_OK_V172:
+        if _cupy_calls_enabled():
             try:
                 _cp_v172.cuda.runtime.deviceSynchronize()
                 _cp_v172.get_default_memory_pool().free_all_blocks()
@@ -1334,7 +1341,7 @@ class BEMRetLayer(object):
         # allocates a 2n RHS + GEMM scratch).  Without this the solve-side
         # pool can balloon by N^2 per wavelength on multi-polarization
         # sweeps even when init() is cached.
-        if _CUPY_OK_V172:
+        if _cupy_calls_enabled():
             try:
                 _cp_v172.cuda.runtime.deviceSynchronize()
                 _cp_v172.get_default_memory_pool().free_all_blocks()
@@ -1542,6 +1549,7 @@ class BEMRetLayer(object):
                 pass
         return G11, G21, H11, H21, G22, G12, H22, H12
 
+    @keep_cuda_device
     def _init_distributed_precond(self, enei: float) -> 'BEMRetLayer':
         """Distributed BEM build for the substrate (layer) solver.
 
@@ -1694,7 +1702,7 @@ class BEMRetLayer(object):
         # Dielectric function values
         eps1_vals = self.p.eps1(enei)
         eps2_vals = self.p.eps2(enei)
-        if np.allclose(eps1_vals, eps1_vals[0]) and np.allclose(eps2_vals, eps2_vals[0]):
+        if np.all(eps1_vals == eps1_vals[0]) and np.all(eps2_vals == eps2_vals[0]):
             eps1 = eps1_vals[0]
             eps2 = eps2_vals[0]
         else:

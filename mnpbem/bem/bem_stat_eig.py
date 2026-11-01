@@ -22,6 +22,7 @@ from ..utils.gpu import (
     matmul_dispatch, solve_dispatch, to_host, is_cupy_array,
     eig_dispatch,
 )
+from ..utils import gpu as _gpu_mod
 from .plasmonmode import plasmonmode
 
 
@@ -47,6 +48,13 @@ try:
 except Exception:
     _cp_eig = None  # type: ignore
     _CUPY_OK_EIG = False
+
+
+def _cupy_calls_enabled() -> bool:
+    # The cupy pool / synchronize calls and the cupy eig of this module open a
+    # CUDA context, so they run only on the GPU path, as in the other solvers:
+    # utils.gpu.use_gpu(), i.e. MNPBEM_GPU=1 (read per call) and a visible device.
+    return _CUPY_OK_EIG and _gpu_mod.use_gpu()
 
 
 def _gpu_eig_available() -> bool:
@@ -165,7 +173,7 @@ def _plasmonmode_gpu(p, F, nev, options):
 
 def _gpu_pool_cleanup_eig(apply_limit: bool = False) -> None:
     """Synchronise CUDA stream then drain cupy default + pinned pools."""
-    if not _CUPY_OK_EIG:
+    if not _cupy_calls_enabled():
         return
     try:
         mempool = _cp_eig.get_default_memory_pool()
@@ -303,18 +311,18 @@ class BEMStatEig(object):
         # plasmonmode() runs its own dense eigensolve.
         if is_cupy_array(F):
             F = to_host(F)
-        if _CUPY_OK_EIG:
+        if _cupy_calls_enabled():
             _gpu_pool_cleanup_eig()
 
         # eigenmode expansion using plasmonmode (or GPU dispatch when opted-in)
-        if USE_GPU_EIG and _CUPY_OK_EIG:
+        if USE_GPU_EIG and _cupy_calls_enabled():
             ene, ur, ul = _plasmonmode_gpu(p, F, nev, options)
         else:
             ene, ur, ul = plasmonmode(p, nev = nev, **options)
         # plasmonmode internally builds (and discards) a dense
         # F + may route through cupy for the eigendecomposition staging.
         # Drain the pool so the constructor leaves the device in a clean state.
-        if _CUPY_OK_EIG:
+        if _cupy_calls_enabled():
             _gpu_pool_cleanup_eig()
 
         # actual number of eigenmodes (may be less than requested)
@@ -350,7 +358,7 @@ class BEMStatEig(object):
         self : BEMStatEig
             Returns self for chaining
         """
-        if self.enei is not None and np.isclose(self.enei, enei):
+        if self.enei is not None and self.enei == enei:
             return self
 
         # drop the previous wavelength's resolvent ``mat``
@@ -530,7 +538,7 @@ class BEMStatEig(object):
         # explicit clear() drains the cupy pool so the device
         # buffer of the released ``mat`` returns immediately, not on next
         # rebuild.  Mirrors BEMStat.clear pattern.
-        if _CUPY_OK_EIG:
+        if _cupy_calls_enabled():
             _gpu_pool_cleanup_eig()
         return self
 

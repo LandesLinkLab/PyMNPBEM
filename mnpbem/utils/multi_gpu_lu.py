@@ -32,9 +32,10 @@ from __future__ import annotations
 import os
 import sys
 import ctypes
+import functools
 import warnings
 from ctypes import c_int, c_int32, c_int64, c_void_p, c_char_p, POINTER, byref
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -157,6 +158,81 @@ def _cuda_device_sync() -> None:
     _libcudart.cudaDeviceSynchronize()
 
 
+def _sync_devices(device_ids: List[int]) -> None:
+    # cusolverMgGetrf does not wait for work queued on a device's legacy
+    # default stream, and a cudaMemcpy from pageable host memory can return
+    # before its DMA has reached the device.  Every device is therefore
+    # synchronized after the host-to-device scatter; otherwise getrf can read
+    # a partly written tile and report a spurious zero pivot (e.g. info=96,
+    # the last column of the first tile).  getrs was found to wait for the
+    # queued writes; the sync before it is defensive.
+    for dev in device_ids:
+        _cuda_set_device(dev)
+        _cuda_device_sync()
+
+
+def _keep_device(fn: Callable) -> Callable:
+    # Restore the caller's current CUDA device when <fn> returns or raises.
+    # The multi-GPU calls switch devices with cudaSetDevice and cupy
+    # allocates on the current device, so without the restore the caller's
+    # next cupy work (e.g. the GPU Green-function assembly) runs on the last
+    # device of <device_ids> next to arrays cached on its own device.
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        dev = c_int(0)
+        _libcudart.cudaGetDevice(byref(dev))
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _libcudart.cudaSetDevice(dev)
+    return wrapper
+
+
+_SHARED_HANDLES: Dict[Tuple[int, ...], Tuple[c_void_p, c_void_p]] = {}
+
+
+def _shared_handle_grid(device_ids: List[int]) -> Tuple[c_void_p, c_void_p]:
+    # One cuSolverMg handle and device grid per device list, kept for the
+    # life of the process and shared by all factorizations.  cusolverMgDestroy
+    # (CUDA 12.4) breaks every other live handle: their next cusolverMgGetrs
+    # returns CUSOLVER_STATUS_EXECUTION_FAILED (6).  This hit BEMRet's host
+    # path, which replaces its LU handles one at a time, and every getrf
+    # fallback, whose discarded handle was destroyed while the others were
+    # still in use.  close() therefore releases only the matrix descriptor
+    # and the device buffers.
+    key = tuple(int(d) for d in device_ids)
+    if key not in _SHARED_HANDLES:
+        lib = _libcusolverMg
+        h = c_void_p(0)
+        _check_status(lib.cusolverMgCreate(byref(h)), 'cusolverMgCreate')
+        dev_arr_c = (c_int * len(key))(*key)
+        _check_status(
+            lib.cusolverMgDeviceSelect(h, c_int(len(key)), dev_arr_c),
+            'cusolverMgDeviceSelect')
+        grid = c_void_p(0)
+        dev_arr32 = (c_int32 * len(key))(*key)
+        _check_status(
+            lib.cusolverMgCreateDeviceGrid(
+                byref(grid), c_int32(1), c_int32(len(key)),
+                dev_arr32, c_int(GRID_MAPPING_COL_MAJOR)),
+            'cusolverMgCreateDeviceGrid')
+        _SHARED_HANDLES[key] = (h, grid)
+    return _SHARED_HANDLES[key]
+
+
+class CuSolverMgGetrfError(RuntimeError):
+    # cusolverMgGetrf returned info != 0: U(info, info) is exactly zero
+    # (info > 0) or argument -info is invalid (info < 0).
+
+    def __init__(self,
+            info: int,
+            n: int) -> None:
+        super().__init__(
+            '[error] cusolverMgGetrf returned info={} for a {} x {} matrix'.format(info, n, n))
+        self.info = int(info)
+        self.n = int(n)
+
+
 # ---------------------------------------------------------------------------
 # cuSolverMg signature setup
 # ---------------------------------------------------------------------------
@@ -214,6 +290,8 @@ def _bind_cusolvermg() -> None:
 
     _libcudart.cudaSetDevice.argtypes = [c_int]
     _libcudart.cudaSetDevice.restype = c_int
+    _libcudart.cudaGetDevice.argtypes = [POINTER(c_int)]
+    _libcudart.cudaGetDevice.restype = c_int
     _libcudart.cudaMalloc.argtypes = [POINTER(c_void_p), c_int64]
     _libcudart.cudaMalloc.restype = c_int
     _libcudart.cudaFree.argtypes = [c_void_p]
@@ -409,6 +487,7 @@ class MultiGPULU(object):
     # Public API
     # ------------------------------------------------------------------
 
+    @_keep_device
     def factor(self,
             A: Any) -> 'MultiGPULU':
 
@@ -453,23 +532,9 @@ class MultiGPULU(object):
         self.cuda_dtype = _cuda_dtype_for(A)
         lib = _libcusolverMg
 
-        # Create handle / grid / descriptor
-        h = c_void_p(0)
-        _check_status(lib.cusolverMgCreate(byref(h)), 'cusolverMgCreate')
+        # Shared handle / grid (see _shared_handle_grid), own descriptor
+        h, grid = _shared_handle_grid(self.device_ids)
         self.handle = h
-
-        dev_arr_c = (c_int * self.n_gpus)(*self.device_ids)
-        _check_status(
-            lib.cusolverMgDeviceSelect(h, c_int(self.n_gpus), dev_arr_c),
-            'cusolverMgDeviceSelect')
-
-        grid = c_void_p(0)
-        dev_arr32 = (c_int32 * self.n_gpus)(*self.device_ids)
-        _check_status(
-            lib.cusolverMgCreateDeviceGrid(
-                byref(grid), c_int32(1), c_int32(self.n_gpus),
-                dev_arr32, c_int(GRID_MAPPING_COL_MAJOR)),
-            'cusolverMgCreateDeviceGrid')
         self.grid = grid
 
         # Allocate per-GPU buffers BEFORE building descriptor (descriptor needs
@@ -487,6 +552,7 @@ class MultiGPULU(object):
 
         # Scatter A to GPUs
         self._scatter_columns(A)
+        _sync_devices(self.device_ids)
 
         # Query workspace size
         lwork = c_int64(0)
@@ -516,11 +582,11 @@ class MultiGPULU(object):
                 self.array_d_work, c_int64(self.work_lwork), byref(info)),
             'cusolverMgGetrf')
         if info.value != 0:
-            raise RuntimeError(
-                '[error] cusolverMgGetrf reports info={} (singular or invalid)'.format(info.value))
+            raise CuSolverMgGetrfError(info.value, N)
         _cuda_device_sync()
         return self
 
+    @_keep_device
     def solve(self,
             B: Any,
             trans: str = 'N') -> np.ndarray:
@@ -578,6 +644,7 @@ class MultiGPULU(object):
                 tile_full[:, local_offset:local_offset + ncols] = B_f[:, start:stop]
                 local_offset += blk_rhs
             _cuda_memcpy_h2d(int(ptrs_B[g] or 0), tile_full)
+        _sync_devices(self.device_ids)
 
         # B descriptor
         descrB = c_void_p(0)
@@ -712,6 +779,7 @@ class MultiGPULU(object):
                 np.ascontiguousarray(B[:, c0:c1]), trans=trans)
         return out
 
+    @_keep_device
     def close(self) -> None:
         lib = _libcusolverMg
         # Synchronize all devices before tearing down so any in-flight kernels
@@ -744,12 +812,9 @@ class MultiGPULU(object):
         if self.descr is not None:
             lib.cusolverMgDestroyMatrixDesc(self.descr)
             self.descr = None
-        if self.grid is not None:
-            lib.cusolverMgDestroyGrid(self.grid)
-            self.grid = None
-        if self.handle is not None:
-            lib.cusolverMgDestroy(self.handle)
-            self.handle = None
+        # The handle and grid are shared (_shared_handle_grid) and stay alive.
+        self.grid = None
+        self.handle = None
 
     def __del__(self) -> None:
         try:

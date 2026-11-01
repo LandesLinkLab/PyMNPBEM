@@ -872,7 +872,7 @@ class GreenRetLayer(object):
         # self.G/self.F untouched.  Requiring self.G is not None prevents a
         # matching-enei early return from handing back a stale scalar block
         # after a component-only (incl. col_range) eval on the same instance.
-        if (self.enei is not None and np.isclose(self.enei, enei)
+        if (self.enei is not None and self.enei == enei
                 and self.G is not None):
             return
 
@@ -971,7 +971,7 @@ class GreenRetLayer(object):
         # only when the caller needs it; a Gp-less cached block therefore
         # forces a rebuild for a later derivative-key request.
         if (self._comp_cache_key is not None
-                and np.isclose(self._comp_cache_key[0], enei)
+                and self._comp_cache_key[0] == enei
                 and self._comp_cache_key[1] == c0
                 and self._comp_cache_key[2] == c1
                 and self.G_comp is not None

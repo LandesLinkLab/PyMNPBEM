@@ -9,7 +9,8 @@ import numpy as np
 from scipy.linalg import lu_factor, lu_solve
 
 from ..greenfun import CompGreenStatLayer, CompStruct
-from ..utils.gpu import lu_factor_dispatch, lu_solve_dispatch, to_host, is_cupy_array
+from ..utils.gpu import lu_factor_dispatch, lu_solve_dispatch, to_host, is_cupy_array, keep_cuda_device
+from ..utils import gpu as _gpu_mod
 
 
 # mirror BEMStat / BEMStatIter's wavelength-end cupy pool
@@ -26,6 +27,13 @@ except Exception:
     _CUPY_OK_LAYER = False
 
 
+def _cupy_calls_enabled() -> bool:
+    # The cupy pool / synchronize calls of this module open a CUDA context, so
+    # they (and the distributed build gated on this) run only on the GPU path:
+    # utils.gpu.use_gpu(), i.e. MNPBEM_GPU=1 (read per call) and a visible device.
+    return _CUPY_OK_LAYER and _gpu_mod.use_gpu()
+
+
 def _vram_share_lu_kwargs() -> dict:
     """Read MNPBEM_VRAM_SHARE_* env vars and return kwargs for lu_factor_dispatch.
 
@@ -33,7 +41,7 @@ def _vram_share_lu_kwargs() -> dict:
     helper in ``bem_ret.py`` so all dense BEM solvers honour the same
     multi-GPU VRAM-share env vars.
     """
-    if os.environ.get('MNPBEM_VRAM_SHARE', '0') != '1':
+    if not _gpu_mod.use_gpu() or os.environ.get('MNPBEM_VRAM_SHARE', '0') != '1':
         return {}
     n_gpus = int(os.environ.get('MNPBEM_VRAM_SHARE_GPUS', '1'))
     if n_gpus <= 1:
@@ -48,7 +56,7 @@ def _vram_share_active() -> bool:
     Mirrors the quasistatic ``BEMStat._vram_share_active`` gate.  Off by
     default; user opts in via ``MNPBEM_VRAM_SHARE_DISTRIBUTED=1``.
     """
-    if not _CUPY_OK_LAYER:
+    if not _cupy_calls_enabled():
         return False
     if os.environ.get('MNPBEM_VRAM_SHARE', '0') != '1':
         return False
@@ -87,7 +95,7 @@ def _vram_share_distributed_kwargs() -> dict:
 
 def _gpu_pool_cleanup_layer(apply_limit: bool = False) -> None:
     """Synchronise CUDA stream then drain cupy default + pinned pools."""
-    if not _CUPY_OK_LAYER:
+    if not _cupy_calls_enabled():
         return
     try:
         mempool = _cp_layer.get_default_memory_pool()
@@ -142,7 +150,7 @@ class BEMStatLayer(object):
         if is_cupy_array(F_obj):
             F_obj = to_host(F_obj)
         self.F = F_obj
-        if _CUPY_OK_LAYER:
+        if _cupy_calls_enabled():
             _gpu_pool_cleanup_layer()
 
         if enei is not None:
@@ -151,7 +159,7 @@ class BEMStatLayer(object):
     def _init_matrices(self,
             enei: float) -> 'BEMStatLayer':
 
-        if self.enei is not None and np.isclose(self.enei, enei):
+        if self.enei is not None and self.enei == enei:
             return self
 
         # Distributed multi-GPU build path. When the dedicated env
@@ -191,7 +199,7 @@ class BEMStatLayer(object):
             H1 = to_host(H1)
         if is_cupy_array(H2):
             H2 = to_host(H2)
-        if _CUPY_OK_LAYER:
+        if _cupy_calls_enabled():
             _gpu_pool_cleanup_layer()
 
         eps1 = np.atleast_1d(self.p.eps1(enei)).astype(complex)
@@ -222,6 +230,7 @@ class BEMStatLayer(object):
 
         return self
 
+    @keep_cuda_device
     def _init_distributed_assemble(self,
             enei: float) -> 'BEMStatLayer':
         """Distributed multi-GPU build for the quasistatic substrate solver.
@@ -381,7 +390,7 @@ class BEMStatLayer(object):
             sig_result = to_host(sig_result)
 
         # post-solve pool drain mirrors BEMStat.__truediv__.
-        if _CUPY_OK_LAYER:
+        if _cupy_calls_enabled():
             _gpu_pool_cleanup_layer()
 
         sig = CompStruct(self.p, exc.enei, sig = sig_result)
@@ -443,7 +452,7 @@ class BEMStatLayer(object):
         self.enei = None
         # explicit clear() signals the user wants the
         # device drained.  Mirrors BEMStat.clear pattern.
-        if _CUPY_OK_LAYER:
+        if _cupy_calls_enabled():
             _gpu_pool_cleanup_layer()
         return self
 

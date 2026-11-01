@@ -278,8 +278,10 @@ class CompGreenRet(object):
             if (full1.closed is not None
                 and len(full1.closed) > 0
                 and all(c is None for c in full1.closed)):
-                for k in range(len(full1.closed)):
-                    full1.closed[k] = [k + 1]
+                # full1.closed holds the masked particles only, set the closed
+                # argument through their indices in the full particle list
+                for k in np.flatnonzero(full1.mask):
+                    full1.set_closed([int(k) + 1])
 
             if full1.closed is not None and any(c is not None for c in full1.closed):
                 # Loop over particles
@@ -1371,18 +1373,17 @@ class CompGreenRet(object):
         eps2_vals = self.p1.eps2(enei)
 
         # Create diagonal matrices or scalars
-        # MATLAB: simplify for unique dielectric functions
+        # MATLAB: simplify for unique dielectric functions, only when both
+        # eps1 and eps2 are unique (a scalar next to a diagonal matrix would
+        # turn L1 - L2 into a full matrix)
         eps1_unique = np.unique(eps1_vals)
         eps2_unique = np.unique(eps2_vals)
 
-        if len(eps1_unique) == 1:
+        if len(eps1_unique) == 1 and len(eps2_unique) == 1:
             eps1 = eps1_unique[0]
-        else:
-            eps1 = np.diag(eps1_vals)
-
-        if len(eps2_unique) == 1:
             eps2 = eps2_unique[0]
         else:
+            eps1 = np.diag(eps1_vals)
             eps2 = np.diag(eps2_vals)
 
         # Green functions and surface derivatives (MATLAB: lines 27-31)
@@ -1411,20 +1412,8 @@ class CompGreenRet(object):
 
         # L matrices [Eq. (22)]
         # Depending on connectivity, L can be full matrix, diagonal, or scalar
-        con_11 = self.con[0][1] if len(self.con) > 0 and len(self.con[0]) > 1 else 0
-        con_12 = self.con[0][1] if len(self.con) > 0 and len(self.con[0]) > 1 else 0
-
-        # Check if all connectivity is zero
-        all_zero = True
-        for i in range(len(self.con)):
-            for j in range(len(self.con[0])):
-                if self.con[i][j] != 0:
-                    all_zero = False
-                    break
-            if not all_zero:
-                break
-
-        if all_zero:
+        # MATLAB: if all(obj.g.con{1, 2} == 0)
+        if np.all(self.con[0][1] == 0):
             L1 = eps1
             L2 = eps2
         else:

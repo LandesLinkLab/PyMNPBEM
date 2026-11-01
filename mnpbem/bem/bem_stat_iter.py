@@ -9,7 +9,8 @@ import numpy as np
 from scipy.sparse.linalg import LinearOperator
 
 from ..greenfun import CompStruct
-from ..utils.gpu import lu_factor_dispatch, lu_solve_dispatch, to_host, is_cupy_array
+from ..utils.gpu import lu_factor_dispatch, lu_solve_dispatch, to_host, is_cupy_array, _vram_share_env_defaults
+from ..utils.gpu import keep_cuda_device, vram_share_devices_visible
 from ..utils.matlab_compat import msqrt
 from .bem_iter import BEMIter
 
@@ -44,17 +45,21 @@ def _vram_share_active_stat() -> bool:
     """Return True when distributed-build is enabled for quasi-static iter.
 
     Activation requirements mirror ``bem_ret_iter._vram_share_active``:
+    - ``MNPBEM_GPU=1`` (as in ``bem_ret._vram_share_active``)
     - ``MNPBEM_VRAM_SHARE=1``
     - ``MNPBEM_VRAM_SHARE_DISTRIBUTED=1`` (gates the heavier distributed
       build path; default off so existing call sites stay bit-identical)
     - ``MNPBEM_VRAM_SHARE_GPUS>=2``
     - cupy + cuSolverMg are importable
+    - the requested devices are visible (else one warning, no attempt)
 
     Distributed build assembles F (quasi-static BEM matrix) directly
     across N GPUs via ``DistributedMatrix.from_func`` + the eval_block
     callback, avoiding the host-resident full ``N x N`` matrix on a
     single device during the precond LU pipeline.
     """
+    if os.environ.get('MNPBEM_GPU', '0') != '1':
+        return False
     if os.environ.get('MNPBEM_VRAM_SHARE', '0') != '1':
         return False
     if os.environ.get('MNPBEM_VRAM_SHARE_DISTRIBUTED', '0') != '1':
@@ -71,9 +76,12 @@ def _vram_share_active_stat() -> bool:
         return False
     try:
         from ..utils.multi_gpu_lu import cusolvermg_available
-        return bool(cusolvermg_available())
+        if not cusolvermg_available():
+            return False
     except Exception:
         return False
+    n_gpus, _, device_ids = _vram_share_env_config_stat()
+    return vram_share_devices_visible(n_gpus, device_ids, 'BEMStatIter')
 
 
 def _vram_share_env_config_stat() -> Tuple[int, str, Optional[List[int]]]:
@@ -308,6 +316,16 @@ except Exception:
     _CUPY_OK_STAT = False
 
 
+def _stat_pool_calls_enabled() -> bool:
+    # The cupy pool / stream calls below create a CUDA context on first use, so
+    # run them only when this module can hold device memory: with MNPBEM_GPU=1,
+    # or when lu_factor_dispatch sends the preconditioner LU to several GPUs,
+    # which it does from MNPBEM_VRAM_SHARE_GPUS>=2 alone (utils/gpu.py).
+    if not _CUPY_OK_STAT:
+        return False
+    return os.environ.get('MNPBEM_GPU', '0') == '1' or _vram_share_env_defaults()[0] is not None
+
+
 def _gpu_pool_cleanup_stat(apply_limit: bool = False) -> None:
     """Synchronise CUDA stream then drain cupy default + pinned memory pools.
 
@@ -320,7 +338,7 @@ def _gpu_pool_cleanup_stat(apply_limit: bool = False) -> None:
     Honours MNPBEM_GPU_POOL_LIMIT_GB (legitimate peaks past this cap will
     OOM; default 0 = uncapped).
     """
-    if not _CUPY_OK_STAT:
+    if not _stat_pool_calls_enabled():
         return
     try:
         mempool = _cp_stat.get_default_memory_pool()
@@ -520,7 +538,7 @@ class BEMStatIter(BEMIter):
         # ``lu_factor_dispatch`` + ``factor_multi_gpu``.
         self.F = dm_F.to_host()
         dm_F.free()
-        if _CUPY_OK_STAT:
+        if _stat_pool_calls_enabled():
             _cp_stat.cuda.runtime.deviceSynchronize()
             _cp_stat.get_default_memory_pool().free_all_blocks()
             _cp_stat.get_default_pinned_memory_pool().free_all_blocks()
@@ -567,7 +585,7 @@ class BEMStatIter(BEMIter):
         # Belt-and-braces inline drain in case the helper short-circuited
         # (cupy not importable on this build).  Guarded so CPU path is
         # untouched.
-        if _CUPY_OK_STAT:
+        if _stat_pool_calls_enabled():
             _cp_stat.get_default_memory_pool().free_all_blocks()
 
         self.enei = enei
@@ -593,7 +611,7 @@ class BEMStatIter(BEMIter):
             # the per-block GPU staging buffers in the pool.  Drain so the
             # subsequent Lambda allocation does not push the pool past the
             # 49 GB cap on a 49 GB A6000.
-            if _CUPY_OK_STAT:
+            if _stat_pool_calls_enabled():
                 _cp_stat.get_default_memory_pool().free_all_blocks()
 
             # Build diagonal Lambda matrix from lambda values
@@ -632,7 +650,7 @@ class BEMStatIter(BEMIter):
             # explicitly so cupy can reclaim before the next wavelength's
             # LU runs.
             del F_dense, Lambda
-            if _CUPY_OK_STAT:
+            if _stat_pool_calls_enabled():
                 _cp_stat.cuda.runtime.deviceSynchronize()
                 _cp_stat.get_default_memory_pool().free_all_blocks()
             _gpu_pool_cleanup_stat()
@@ -666,6 +684,7 @@ class BEMStatIter(BEMIter):
 
         return self
 
+    @keep_cuda_device
     def _init_distributed_schur(self,
             enei: float) -> 'BEMStatIter':
         """VRAM-Schur: distributed Schur reduction for the iter path.
@@ -751,7 +770,7 @@ class BEMStatIter(BEMIter):
         self._schur_reduce_keepalive = None
         _gc.collect()
         _gpu_pool_cleanup_stat(apply_limit = True)
-        if _CUPY_OK_STAT:
+        if _stat_pool_calls_enabled():
             _cp_stat.get_default_memory_pool().free_all_blocks()
 
         self.enei = enei
@@ -841,7 +860,7 @@ class BEMStatIter(BEMIter):
         self._schur_active = True
 
         # Final sync + pool compaction across all participating devices.
-        if _CUPY_OK_STAT:
+        if _stat_pool_calls_enabled():
             try:
                 for d in device_ids:
                     _cp_stat.cuda.runtime.setDevice(d)
@@ -898,7 +917,7 @@ class BEMStatIter(BEMIter):
         # build-up.  The init pipeline above leaves up to 2 N^2 * 16 B of
         # transient asarray buffers in the pool; releasing them now keeps
         # peak usage during the iter loop bounded to LU + Krylov subspace.
-        if _CUPY_OK_STAT:
+        if _stat_pool_calls_enabled():
             _cp_stat.cuda.runtime.deviceSynchronize()
             _cp_stat.get_default_memory_pool().free_all_blocks()
         _gpu_pool_cleanup_stat()
@@ -914,16 +933,37 @@ class BEMStatIter(BEMIter):
             # (-Lambda - F) factor and would need re-factoring on the
             # core block.
             from .schur_iter_helpers import make_distributed_schur_preconditioner
+            from .bem_ret_iter import _columnwise
             op = self._schur_op
-            b_eff = op.reduce_rhs(b)
             fm_schur = make_distributed_schur_preconditioner(self._mat_lu)
-            x_core, _ = self._iter_solve(None, b_eff, op._matvec, fm_schur)
-            x = op.recover_full(x_core, b)
+
+            # The Schur operator acts on one excitation (one column of
+            # phip).  As in MATLAB (solve.m, afun.m, mfun.m), all columns are
+            # solved as one stacked vector, and the operator and the
+            # preconditioner are applied column by column.
+            n_core = op.shape[0]
+            if fm_schur is not None and self._mat_lu[1].N != n_core:
+                # a multi-GPU LU of the full (N, N) matrix from the non-distributed
+                # path (MNPBEM_VRAM_SHARE_GPUS>=2), not the reduced LU of
+                # _init_distributed_schur: it does not apply to the core system
+                fm_schur = None
+            b_cols = b.reshape(op.nfaces, -1)
+            ncol = b_cols.shape[1]
+            b_eff = np.empty((n_core, ncol), dtype = complex)
+            for j in range(ncol):
+                b_eff[:, j] = op.reduce_rhs(b_cols[:, j])
+            fm_cols = None if fm_schur is None else _columnwise(fm_schur, n_core, ncol)
+            x_core, _ = self._iter_solve(None, b_eff.ravel(), _columnwise(op._matvec, n_core, ncol), fm_cols)
+            x_core = x_core.reshape(n_core, ncol)
+            x = np.empty((op.nfaces, ncol), dtype = complex)
+            for j in range(ncol):
+                x[:, j] = op.recover_full(x_core[:, j], b_cols[:, j])
+            x = x.ravel()
             # drop the Schur-reduced Krylov subspace handle and
             # the matvec closure references before the next wavelength
             # entry drains the pool.
             del x_core
-            if _CUPY_OK_STAT:
+            if _stat_pool_calls_enabled():
                 _cp_stat.cuda.runtime.deviceSynchronize()
                 _cp_stat.get_default_memory_pool().free_all_blocks()
             _gpu_pool_cleanup_stat()
@@ -947,7 +987,7 @@ class BEMStatIter(BEMIter):
             # Once x is computed the matvec closures are dead refs;
             # drop them so the pool can compact before the next solve.
             del fa, fm
-            if _CUPY_OK_STAT:
+            if _stat_pool_calls_enabled():
                 _cp_stat.cuda.runtime.deviceSynchronize()
                 _cp_stat.get_default_memory_pool().free_all_blocks()
             _gpu_pool_cleanup_stat()
@@ -965,7 +1005,7 @@ class BEMStatIter(BEMIter):
         # (RHS reshape staging, matvec scratch) before returning so the
         # caller's wavelength loop sees a fully drained pool when it
         # advances to the next enei.
-        if _CUPY_OK_STAT:
+        if _stat_pool_calls_enabled():
             _cp_stat.get_default_memory_pool().free_all_blocks()
         _gpu_pool_cleanup_stat()
 
@@ -992,7 +1032,7 @@ class BEMStatIter(BEMIter):
             self._init_matrices(cached_enei)
             # the densify-and-LU pipeline above can spike GPU
             # usage by ~3 N^2 transient; drain so GMRES sees max headroom.
-            if _CUPY_OK_STAT:
+            if _stat_pool_calls_enabled():
                 _cp_stat.cuda.runtime.deviceSynchronize()
                 _cp_stat.get_default_memory_pool().free_all_blocks()
 
@@ -1022,6 +1062,7 @@ class BEMStatIter(BEMIter):
             inout: int = 2) -> CompStruct:
 
         # MATLAB: bemstatiter/field.m
+        from .bem_ret_iter import _interp_deriv
         n = self.p.n if hasattr(self.p, 'n') else self.p.nfaces
         nvec = self.p.nvec
 
@@ -1032,20 +1073,19 @@ class BEMStatIter(BEMIter):
             H = self._g.H2
 
         # MATLAB: e = -outer(obj.p.nvec, matmul(obj.g.H, sig.sig))
-        H_sig = H @ sig.sig.reshape(n, -1)
+        H_sig = (H @ sig.sig.reshape(n, -1)).reshape(sig.sig.shape)
         if H_sig.ndim == 1:
             e = -nvec * H_sig[:, np.newaxis]
         else:
             e = -nvec[:, :, np.newaxis] * H_sig[:, np.newaxis, :]
         # drain after the field-side matvec to keep the pool from
         # accumulating across repeated field() calls in a wavelength loop.
-        if _CUPY_OK_STAT:
+        if _stat_pool_calls_enabled():
             _cp_stat.get_default_memory_pool().free_all_blocks()
 
         # Tangential directions via interpolation
-        G_sig = self._g.G @ sig.sig.reshape(n, -1)
-        phi = self.p.interp(G_sig)
-        phi1, phi2, t1, t2 = self.p.deriv(phi)
+        G_sig = (self._g.G @ sig.sig.reshape(n, -1)).reshape(sig.sig.shape)
+        phi1, phi2, t1, t2 = _interp_deriv(self.p, G_sig)
 
         # Normal vector
         nvec_c = np.cross(t1, t2)
@@ -1066,7 +1106,7 @@ class BEMStatIter(BEMIter):
         # drain residual transient buffers from the interp/deriv
         # pipeline before returning so a follow-up potential()/field() at
         # a different wavelength does not see leftover blocks.
-        if _CUPY_OK_STAT:
+        if _stat_pool_calls_enabled():
             _cp_stat.get_default_memory_pool().free_all_blocks()
 
         return CompStruct(self.p, sig.enei, e = e)
@@ -1080,7 +1120,7 @@ class BEMStatIter(BEMIter):
         # drain after the Green-function potential evaluation so
         # repeated potential() calls in a wavelength loop don't leak
         # transient asarray buffers into the cupy pool.
-        if _CUPY_OK_STAT:
+        if _stat_pool_calls_enabled():
             _cp_stat.get_default_memory_pool().free_all_blocks()
         return pot
 
@@ -1131,7 +1171,7 @@ class BEMStatIter(BEMIter):
         # explicit clear() means the user wants the device drained.
         # Without this the LU buffer just released above stays in the cupy
         # pool until the next solve triggers a free_all_blocks.
-        if _CUPY_OK_STAT:
+        if _stat_pool_calls_enabled():
             _cp_stat.cuda.runtime.deviceSynchronize()
             _cp_stat.get_default_memory_pool().free_all_blocks()
             _cp_stat.get_default_pinned_memory_pool().free_all_blocks()
@@ -1147,7 +1187,7 @@ class BEMStatIter(BEMIter):
         # __call__(enei') sequences keep the pool tight even when only
         # the H-matrix evaluator side allocates transient buffers.
         out = self._init_matrices(enei)
-        if _CUPY_OK_STAT:
+        if _stat_pool_calls_enabled():
             _cp_stat.get_default_memory_pool().free_all_blocks()
         return out
 

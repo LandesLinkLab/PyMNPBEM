@@ -21,7 +21,8 @@ import numpy as np
 from scipy.linalg import lu_factor, lu_solve
 from ..greenfun import CompGreenStat, CompStruct
 from ..utils.matlab_compat import msqrt
-from ..utils.gpu import lu_factor_dispatch, lu_solve_dispatch, to_host, is_cupy_array
+from ..utils.gpu import lu_factor_dispatch, lu_solve_dispatch, to_host, is_cupy_array, keep_cuda_device
+from ..utils import gpu as _gpu_mod
 
 
 # memory-pool parity: BEMStat's quasistatic single-LU pipeline
@@ -42,8 +43,15 @@ except Exception:
     _CUPY_OK_V172 = False
 
 
+def _cupy_calls_enabled() -> bool:
+    # The cupy pool / synchronize calls of this module open a CUDA context, so
+    # they (and the distributed build gated on this) run only on the GPU path:
+    # utils.gpu.use_gpu(), i.e. MNPBEM_GPU=1 (read per call) and a visible device.
+    return _CUPY_OK_V172 and _gpu_mod.use_gpu()
+
+
 def _vram_share_lu_kwargs() -> dict:
-    if os.environ.get('MNPBEM_VRAM_SHARE', '0') != '1':
+    if not _gpu_mod.use_gpu() or os.environ.get('MNPBEM_VRAM_SHARE', '0') != '1':
         return {}
     n_gpus = int(os.environ.get('MNPBEM_VRAM_SHARE_GPUS', '1'))
     if n_gpus <= 1:
@@ -63,7 +71,7 @@ def _vram_share_active() -> bool:
     must opt in via ``MNPBEM_VRAM_SHARE_DISTRIBUTED=1`` so existing
     LU-only multi-GPU sweeps keep their build path.
     """
-    if not _CUPY_OK_V172:
+    if not _cupy_calls_enabled():
         return False
     if os.environ.get('MNPBEM_VRAM_SHARE', '0') != '1':
         return False
@@ -290,7 +298,7 @@ class BEMStat(object):
             # Drop the stale handle first so free_all_blocks can actually
             # return the device storage to the pool.
             self.mat_lu = None
-            if _CUPY_OK_V172:
+            if _cupy_calls_enabled():
                 try:
                     _mempool_pre = _cp_v172.get_default_memory_pool()
                     _pinned_pre = _cp_v172.get_default_pinned_memory_pool()
@@ -320,7 +328,7 @@ class BEMStat(object):
             # routes through cupy (EpsTable lookup with GPU index_select)
             # the scratch arrays are tiny but still kept by the pool until
             # explicit release.
-            if _CUPY_OK_V172:
+            if _cupy_calls_enabled():
                 try:
                     _cp_v172.cuda.runtime.deviceSynchronize()
                     _cp_v172.get_default_memory_pool().free_all_blocks()
@@ -335,7 +343,7 @@ class BEMStat(object):
             # MATLAB: obj.mat = -inv(diag(lambda) + obj.F)
             Lambda = np.diag(lambda_diag)
             del lambda_diag
-            if _CUPY_OK_V172:
+            if _cupy_calls_enabled():
                 try:
                     _cp_v172.cuda.runtime.deviceSynchronize()
                     _cp_v172.get_default_memory_pool().free_all_blocks()
@@ -346,7 +354,7 @@ class BEMStat(object):
             # M_full it is no longer needed.  Drop the local handle so the
             # cupy pool reclaims it before the LU factor below.
             del Lambda
-            if _CUPY_OK_V172:
+            if _cupy_calls_enabled():
                 try:
                     _cp_v172.cuda.runtime.deviceSynchronize()
                     _cp_v172.get_default_memory_pool().free_all_blocks()
@@ -377,7 +385,7 @@ class BEMStat(object):
                     del M_eff
                     # post-Schur-LU pool drain (the schur_eliminate
                     # work arrays plus the LU scratch can each be N^2).
-                    if _CUPY_OK_V172:
+                    if _cupy_calls_enabled():
                         try:
                             _cp_v172.cuda.runtime.deviceSynchronize()
                             _cp_v172.get_default_memory_pool().free_all_blocks()
@@ -391,7 +399,7 @@ class BEMStat(object):
             # pool can recycle its N^2 buffer.  Sync + free so the next
             # wavelength enters _init_matrices with a clean slate.
             del M_full
-            if _CUPY_OK_V172:
+            if _cupy_calls_enabled():
                 try:
                     _cp_v172.cuda.runtime.deviceSynchronize()
                     _cp_v172.get_default_memory_pool().free_all_blocks()
@@ -405,6 +413,7 @@ class BEMStat(object):
 
         return self
 
+    @keep_cuda_device
     def _init_distributed_assemble(self, enei):
         """Distributed multi-GPU quasistatic BEM matrix assembly.
 
@@ -564,6 +573,7 @@ class BEMStat(object):
         self.enei = enei
         return self
 
+    @keep_cuda_device
     def _init_distributed_schur(self, enei):
         """VRAM-Schur: distributed BEM matrix build + Schur reduction.
 
@@ -797,7 +807,7 @@ class BEMStat(object):
         # side pool can grow steadily on multi-polarization sweeps even
         # when _init_matrices is cached.  Mirrors BEMRet.solve's closing
         # pattern.
-        if _CUPY_OK_V172:
+        if _cupy_calls_enabled():
             try:
                 _cp_v172.cuda.runtime.deviceSynchronize()
                 _cp_v172.get_default_memory_pool().free_all_blocks()
@@ -818,7 +828,7 @@ class BEMStat(object):
         sig_full = self._schur_recover(sig_core, b_full)
         # post-Schur-recover pool drain — the recover callable
         # allocates the shell-face restore vector + a GEMM scratch.
-        if _CUPY_OK_V172:
+        if _cupy_calls_enabled():
             try:
                 _cp_v172.cuda.runtime.deviceSynchronize()
                 _cp_v172.get_default_memory_pool().free_all_blocks()
@@ -908,9 +918,16 @@ class BEMStat(object):
             # Tangential directions computed by interpolation and derivative
             # MATLAB: phi = interp(obj.p, matmul(obj.g.G, sig.sig))
             #         [phi1, phi2, t1, t2] = deriv(obj.p, phi)
-            G_sig = self._matmul(self.g.G, sig.sig)
-            phi = self.p.interp(G_sig)
-            phi1, phi2, t1, t2 = self.p.deriv(phi)
+            # Particle.interp_values takes (nfaces, ncol) arrays and Particle.deriv
+            # works on real values, so G @ sig is flattened to (nfaces, -1) and the
+            # real and imaginary parts are differentiated separately (deriv is linear).
+            G_sig = np.asarray(self._matmul(self.g.G, sig.sig))
+            siz = G_sig.shape
+            phi = self.p.interp_values(G_sig.reshape(siz[0], -1))[0]
+            re1, re2, t1, t2 = self.p.deriv(np.ascontiguousarray(np.real(phi)))
+            im1, im2 = self.p.deriv(np.ascontiguousarray(np.imag(phi)))[:2]
+            phi1 = (np.reshape(re1, (siz[0], -1)) + 1j * np.reshape(im1, (siz[0], -1))).reshape(siz)
+            phi2 = (np.reshape(re2, (siz[0], -1)) + 1j * np.reshape(im2, (siz[0], -1))).reshape(siz)
 
             # Normal vector
             # MATLAB: nvec = cross(t1, t2)
@@ -1022,7 +1039,7 @@ class BEMStat(object):
         # the device immediately (analogous to MATLAB's wavelength-end
         # immediate free).  Pinned pool too in case potential() / field()
         # routed any host transfers through pinned scratch.
-        if _CUPY_OK_V172:
+        if _cupy_calls_enabled():
             try:
                 _cp_v172.cuda.runtime.deviceSynchronize()
                 _cp_v172.get_default_memory_pool().free_all_blocks()
@@ -1064,7 +1081,7 @@ class BEMStat(object):
             # the LU back-substitute allocates an O(N) scratch per RHS;
             # free it eagerly so a long-running sweep does not accumulate
             # solve-side residue.
-            if _CUPY_OK_V172:
+            if _cupy_calls_enabled():
                 try:
                     _cp_v172.cuda.runtime.deviceSynchronize()
                     _cp_v172.get_default_memory_pool().free_all_blocks()

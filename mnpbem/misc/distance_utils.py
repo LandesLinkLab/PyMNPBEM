@@ -229,30 +229,20 @@ def _p_poly_dist(x: float, y: float,
         yv = np.append(yv, yv[0])
         nv = nv + 1
 
-    # line parameters
-    a_coeff = -np.diff(yv)
-    b_coeff = np.diff(xv)
-    c_coeff = yv[1:] * xv[:-1] - xv[1:] * yv[:-1]
-
-    # projection of point onto each rib
-    ab = 1.0 / (a_coeff ** 2 + b_coeff ** 2 + 1e-30)
-    vv = a_coeff * x + b_coeff * y + c_coeff
-    xp = x - (a_coeff * ab) * vv
-    yp = y - (b_coeff * ab) * vv
-
-    # find where projected point is inside segment
-    idx_x = ((xp >= np.minimum(xv[:-1], xv[1:])) & (xp <= np.maximum(xv[:-1], xv[1:])))
-    idx_y = ((yp >= np.minimum(yv[:-1], yv[1:])) & (yp <= np.maximum(yv[:-1], yv[1:])))
-    idx = idx_x & idx_y
-
-    # distance to vertices
-    dv = np.sqrt((xv[:-1] - x) ** 2 + (yv[:-1] - y) ** 2)
-
-    if not np.any(idx):
-        d = np.min(dv)
-    else:
-        dp = np.sqrt((xp[idx] - x) ** 2 + (yp[idx] - y) ** 2)
-        d = min(np.min(dv), np.min(dp))
+    # Distance to each rib from the projection onto the segment, with the
+    # segment parameter t clamped to [0, 1] (t = 0, 1 give the vertices).
+    # MATLAB p_poly_dist accepts the projection onto the infinite line only if
+    # it lies inside the bounding box of the rib; for a rib parallel to an
+    # in-plane axis rounding can put it outside, and the distance falls back to
+    # the vertices (demospecstat16: points 0.125 nm above the flat face of the
+    # disk that project onto a face edge got 0.57-1.49 nm instead of 0.125 nm).
+    dx = np.diff(xv)
+    dy = np.diff(yv)
+    len2 = dx ** 2 + dy ** 2
+    # degenerate (zero-length) ribs give t = 0, i.e. the vertex distance
+    t = ((x - xv[:-1]) * dx + (y - yv[:-1]) * dy) / np.where(len2 > 0, len2, 1.0)
+    t = np.clip(t, 0.0, 1.0)
+    d = np.min(np.sqrt((xv[:-1] + t * dx - x) ** 2 + (yv[:-1] + t * dy - y) ** 2))
 
     # check if point is inside polygon
     from matplotlib.path import Path

@@ -51,6 +51,8 @@ from typing import Any, Callable, Optional, Tuple
 import numpy as np
 from scipy.linalg import lu_factor, lu_solve
 
+from ..utils.gpu import keep_cuda_device
+
 
 def schur_eliminate(M_full: np.ndarray,
         shell_indices: np.ndarray,
@@ -186,6 +188,7 @@ def schur_memory_estimate(nfaces_total: int, nfaces_shell: int) -> dict:
 # Distributed Schur (VRAM-Schur)
 # ---------------------------------------------------------------------------
 
+@keep_cuda_device
 def schur_eliminate_distributed(
         M_eval: Callable[[int, int], np.ndarray],
         N_full: int,

@@ -2346,6 +2346,13 @@ class Particle(object):
         self : Particle
             Cleaned particle
         """
+        # MATLAB clean.m selects the faces with obj.area, i.e. with the areas
+        # from before the vertex merge (norm is only called after select).
+        # A particle built with norm='off' has no areas yet.
+        if self.area.shape[0] != self.nfaces:
+            self._norm()
+        area = self.area
+
         # Round vertices to avoid floating point issues
         verts_rounded = mround(self.verts, 8)
 
@@ -2382,9 +2389,9 @@ class Particle(object):
 
         self._norm()
 
-        # Keep only elements with sufficient area
-        mean_area = np.mean(self.area)
-        valid_idx = np.where(self.area > cutoff * mean_area)[0]
+        # Keep only elements with sufficient area (areas before the merge)
+        mean_area = np.mean(area)
+        valid_idx = np.where(area > cutoff * mean_area)[0]
 
         if len(valid_idx) < self.nfaces:
             result, _ = self.select(index=valid_idx)
@@ -2429,9 +2436,11 @@ class Particle(object):
         n = self.nfaces
         ncols = v_reshaped.shape[1]
 
-        # Initialize outputs
-        v1 = np.zeros((n, ncols))
-        v2 = np.zeros((n, ncols))
+        # Initialize outputs (complex input keeps its imaginary part, MATLAB
+        # grows v1 / v2 with the type of v)
+        v_dtype = np.result_type(v_reshaped.dtype, np.float64)
+        v1 = np.zeros((n, ncols), dtype = v_dtype)
+        v2 = np.zeros((n, ncols), dtype = v_dtype)
         t1 = np.zeros((n, 3))
         t2 = np.zeros((n, 3))
 
@@ -2607,7 +2616,13 @@ class Particle(object):
 
             mat = csr_matrix((data, (rows, cols)), shape=(nfaces, nverts))
 
-        vi = mat @ v
+        # MATLAB matmul: multiply along the first dimension, trailing
+        # dimensions (e.g. nfaces x 3 x npol) are kept
+        v = np.asarray(v)
+        if v.ndim > 2:
+            vi = (mat @ v.reshape(v.shape[0], -1)).reshape((mat.shape[0],) + v.shape[1:])
+        else:
+            vi = mat @ v
         return vi, mat
 
     # ==================== Visualization ====================

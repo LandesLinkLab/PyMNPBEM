@@ -7,7 +7,8 @@ from typing import Optional, List, Tuple, Any, Union
 from ..greenfun import CompStruct
 from ..greenfun.compgreen_stat_mirror import CompGreenStatMirror
 from ..geometry.comparticle_mirror import CompStructMirror
-from ..utils.gpu import lu_factor_dispatch, lu_solve_dispatch, to_host, is_cupy_array
+from ..utils.gpu import lu_factor_dispatch, lu_solve_dispatch, to_host, is_cupy_array, keep_cuda_device
+from ..utils import gpu as _gpu_mod
 
 
 # BEMStatMirror dense LU loop now honours the same
@@ -23,10 +24,17 @@ except Exception:
     _CUPY_OK_MIRROR = False
 
 
+def _cupy_calls_enabled() -> bool:
+    # The cupy pool / synchronize calls of this module open a CUDA context, so
+    # they (and the distributed build gated on this) run only on the GPU path:
+    # utils.gpu.use_gpu(), i.e. MNPBEM_GPU=1 (read per call) and a visible device.
+    return _CUPY_OK_MIRROR and _gpu_mod.use_gpu()
+
+
 def _vram_share_lu_kwargs() -> dict:
     """Read MNPBEM_VRAM_SHARE_* env vars and return kwargs for
     lu_factor_dispatch.  Mirrors the helper in ``bem_ret.py``."""
-    if os.environ.get('MNPBEM_VRAM_SHARE', '0') != '1':
+    if not _gpu_mod.use_gpu() or os.environ.get('MNPBEM_VRAM_SHARE', '0') != '1':
         return {}
     n_gpus = int(os.environ.get('MNPBEM_VRAM_SHARE_GPUS', '1'))
     if n_gpus <= 1:
@@ -41,7 +49,7 @@ def _vram_share_active() -> bool:
     Mirrors ``BEMStat._vram_share_active``.  Off by default; user opts
     in via ``MNPBEM_VRAM_SHARE_DISTRIBUTED=1``.
     """
-    if not _CUPY_OK_MIRROR:
+    if not _cupy_calls_enabled():
         return False
     if os.environ.get('MNPBEM_VRAM_SHARE', '0') != '1':
         return False
@@ -80,7 +88,7 @@ def _vram_share_distributed_kwargs() -> dict:
 
 def _gpu_pool_cleanup_mirror(apply_limit: bool = False) -> None:
     """Synchronise CUDA stream then drain cupy default + pinned pools."""
-    if not _CUPY_OK_MIRROR:
+    if not _cupy_calls_enabled():
         return
     try:
         mempool = _cp_mirror.get_default_memory_pool()
@@ -179,7 +187,7 @@ class BEMStatMirror(object):
         # extraction.  Each block went through a host round-trip (asnumpy)
         # so the cupy view of the underlying full F (potentially N^2) can
         # be released here.
-        if _CUPY_OK_MIRROR:
+        if _cupy_calls_enabled():
             _gpu_pool_cleanup_mirror()
 
         # resolvent matrices
@@ -193,7 +201,7 @@ class BEMStatMirror(object):
 
         MATLAB: @bemstatmirror/subsref.m case '()'
         """
-        if self.enei is not None and np.isclose(self.enei, enei):
+        if self.enei is not None and self.enei == enei:
             return self
 
         # Distributed multi-GPU build path: each per-symmetry F[i]
@@ -235,7 +243,7 @@ class BEMStatMirror(object):
             # buffer can return to the pool before the next iteration's
             # GEMM/LU runs.  Important when n_sym >= 2 on large meshes.
             del M_full
-            if _CUPY_OK_MIRROR:
+            if _cupy_calls_enabled():
                 _gpu_pool_cleanup_mirror()
 
         self.enei = enei
@@ -244,6 +252,7 @@ class BEMStatMirror(object):
         _gpu_pool_cleanup_mirror()
         return self
 
+    @keep_cuda_device
     def _init_distributed_assemble(self,
             enei: float) -> 'BEMStatMirror':
         """Distributed multi-GPU build for the quasistatic mirror solver.
@@ -396,7 +405,7 @@ class BEMStatMirror(object):
         # post-solve pool drain (per-symmetry LU back-
         # substitute leaves O(N) scratch in the pool; release before next
         # wavelength's __truediv__ enters).
-        if _CUPY_OK_MIRROR:
+        if _cupy_calls_enabled():
             _gpu_pool_cleanup_mirror()
 
         return sig, self
@@ -476,7 +485,7 @@ class BEMStatMirror(object):
                             pass
         self.mat_lu = None
         self.enei = None
-        if _CUPY_OK_MIRROR:
+        if _cupy_calls_enabled():
             _gpu_pool_cleanup_mirror()
         return self
 

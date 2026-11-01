@@ -47,8 +47,9 @@ class ValArray(object):
             # expand to full size or interpolate from faces to vertices
             if val.shape[0] == 1:
                 val = np.tile(val, (p.nverts, 1))
-            if val.shape[0] == p.n and hasattr(p, 'interp'):
-                val = p.interp(val)
+            if val.shape[0] == p.n:
+                # MATLAB: val = interp( p, val )
+                val, _ = p.interp_values(val)
             self.val = val
             self.truecolor = truecolor
         else:
@@ -66,8 +67,9 @@ class ValArray(object):
         if val is not None:
             if val.shape[0] == 1:
                 val = np.tile(val, (self.p.nverts, 1))
-            if val.shape[0] == self.p.n and hasattr(self.p, 'interp'):
-                val = self.p.interp(val)
+            if val.shape[0] == self.p.n:
+                # MATLAB: val = interp( obj.p, val )
+                val, _ = self.p.interp_values(val)
             self.val = val
             self.truecolor = truecolor
         else:
